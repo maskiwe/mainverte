@@ -1,0 +1,1413 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#10b981">
+    <meta name="description" content="L'app qui te donne la main verte - identifie et entretiens tes plantes avec l'IA">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="apple-mobile-web-app-title" content="Main Verte">
+    <title>Main Verte</title>
+    <link rel="manifest" href="/manifest.json">
+    <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+    <link rel="icon" type="image/png" sizes="512x512" href="/icon-512.png">
+    <link rel="apple-touch-icon" href="/icon-192.png">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+    <style>
+        body { overscroll-behavior: none; -webkit-font-smoothing: antialiased; }
+        .plant-card { transition: transform 0.2s; }
+        .plant-card:active { transform: scale(0.98); }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .fade-in { animation: fadeIn 0.3s ease-out; }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.6} }
+        .pulse-care { animation: pulse 2s ease-in-out infinite; }
+    </style>
+</head>
+<body class="bg-gradient-to-br from-emerald-50 to-teal-50 min-h-screen">
+<div id="root"></div>
+
+<script>
+// =====================================================
+// IndexedDB Storage - runs BEFORE React/Babel
+// Solves localStorage 5MB limit (photos are huge)
+// IndexedDB has 50MB+ capacity
+// =====================================================
+const DB_NAME = 'PlantMonitorDB';
+const DB_VERSION = 1;
+const STORE_NAME = 'plants';
+
+function openDB() {
+    return new Promise((resolve, reject) => {
+        const req = indexedDB.open(DB_NAME, DB_VERSION);
+        req.onupgradeneeded = (e) => {
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains(STORE_NAME)) {
+                db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+            }
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+    });
+}
+
+async function dbLoadPlants() {
+    try {
+        const db = await openDB();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(STORE_NAME, 'readonly');
+            const store = tx.objectStore(STORE_NAME);
+            const req = store.getAll();
+            req.onsuccess = () => resolve(req.result || []);
+            req.onerror = () => reject(req.error);
+        });
+    } catch (e) {
+        console.error('DB load error:', e);
+        // Fallback: try localStorage migration
+        try {
+            const raw = localStorage.getItem('plant_monitor_v2');
+            if (raw) return JSON.parse(raw);
+        } catch (e2) {}
+        return [];
+    }
+}
+
+async function dbSavePlants(plants) {
+    try {
+        const db = await openDB();
+        const tx = db.transaction(STORE_NAME, 'readwrite');
+        const store = tx.objectStore(STORE_NAME);
+        // Clear and re-add all (simple, reliable)
+        store.clear();
+        plants.forEach(p => store.put(p));
+        return new Promise((resolve, reject) => {
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => reject(tx.error);
+        });
+    } catch (e) {
+        console.error('DB save error:', e);
+        return false;
+    }
+}
+
+// =====================================================
+// Photo compression - resize to max 800px, JPEG 60%
+// A 4MB phone photo becomes ~60-100KB
+// =====================================================
+function compressPhoto(file, maxSize, quality) {
+    maxSize = maxSize || 800;
+    quality = quality || 0.6;
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            const img = new Image();
+            img.onload = () => {
+                const canvas = document.createElement('canvas');
+                let w = img.width, h = img.height;
+                if (w > h) {
+                    if (w > maxSize) { h = Math.round(h * maxSize / w); w = maxSize; }
+                } else {
+                    if (h > maxSize) { w = Math.round(w * maxSize / h); h = maxSize; }
+                }
+                canvas.width = w;
+                canvas.height = h;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0, w, h);
+                // Get as JPEG base64
+                const dataUrl = canvas.toDataURL('image/jpeg', quality);
+                const b64 = dataUrl.split(',')[1];
+                resolve(b64);
+            };
+            img.onerror = () => reject(new Error('Erreur image'));
+            img.src = e.target.result;
+        };
+        reader.onerror = () => reject(new Error('Erreur lecture'));
+        reader.readAsDataURL(file);
+    });
+}
+
+// Also keep raw base64 for API (higher quality for identification)
+function fileToBase64(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result.split(',')[1]);
+        reader.onerror = () => reject(new Error('Erreur lecture'));
+        reader.readAsDataURL(file);
+    });
+}
+
+// Expose to React
+window.PlantDB = { load: dbLoadPlants, save: dbSavePlants };
+window.PhotoUtils = { compress: compressPhoto, toBase64: fileToBase64 };
+</script>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ===================== SEASON =====================
+function getSeason() {
+    const m = new Date().getMonth();
+    if (m>=3 && m<=5) return {name:'Printemps',icon:'🌸',mult:0.85,desc:'Arrosage un peu plus frequent qu\'en automne'};
+    if (m>=6 && m<=8) return {name:'Ete',icon:'☀️',mult:0.7,desc:'Arrosage plus frequent (la terre seche vite)'};
+    if (m>=9 && m<=10) return {name:'Automne',icon:'🍂',mult:1.0,desc:'Frequence de base'};
+    return {name:'Hiver',icon:'❄️',mult:1.3,desc:'Arrosage plus espace (les plantes sont au repos)'};
+}
+function adjFreq(base) { return Math.max(1, Math.round(base * getSeason().mult)); }
+
+function getActivePrescription(plant) {
+    if (!plant.prescription) return null;
+    if (new Date(plant.prescription.endDate) < new Date()) return null;
+    return plant.prescription;
+}
+function getEffectiveFreq(plant) {
+    const rx = getActivePrescription(plant);
+    if (rx && rx.noWatering) return 999;
+    if (rx && rx.wateringMultiplier !== undefined) return Math.max(1, Math.round(plant.wateringFrequency * rx.wateringMultiplier));
+    return adjFreq(plant.wateringFrequency);
+}
+function rxDaysLeft(plant) {
+    const rx = getActivePrescription(plant);
+    if (!rx) return 0;
+    return Math.max(0, Math.ceil((new Date(rx.endDate) - new Date()) / 86400000));
+}
+
+// ===================== JSON / GEMINI =====================
+function extractJSON(text) {
+    try { return JSON.parse(text); } catch {}
+    let c = text.replace(/```json\s*/gi,'').replace(/```\s*/gi,'').trim();
+    try { return JSON.parse(c); } catch {}
+    const s=c.indexOf('{'), e=c.lastIndexOf('}');
+    if (s!==-1 && e>s) {
+        const b=c.substring(s,e+1);
+        try { return JSON.parse(b); } catch {}
+        try { return JSON.parse(b.replace(/'/g,'"').replace(/,\s*}/g,'}').replace(/,\s*]/g,']').replace(/[\n\t]/g,' ')); } catch {}
+    }
+    throw new Error('Reponse illisible. Reessaie.');
+}
+function extractAnswer(data) {
+    const parts = data.candidates?.[0]?.content?.parts;
+    if (!parts?.length) return null;
+    for (let i=parts.length-1;i>=0;i--) { if (!parts[i].thought && parts[i].text) return parts[i].text; }
+    for (let i=parts.length-1;i>=0;i--) { if (parts[i].text) return parts[i].text; }
+    return null;
+}
+
+async function callGemini(base64, mimeType, prompt) {
+    const apiKey = localStorage.getItem('gemini_api_key');
+    if (!apiKey) throw new Error('Configure ta cle API dans Reglages.');
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+    const body = {
+        contents:[{parts:[{text:prompt},{inline_data:{mime_type:mimeType,data:base64}}]}],
+        generationConfig:{temperature:0.2,maxOutputTokens:1200,responseMimeType:'application/json',thinkingConfig:{thinkingBudget:0}}
+    };
+    let resp = await fetch(url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if (resp.status===400) {
+        const eb = await resp.json().catch(()=>({}));
+        if (JSON.stringify(eb).includes('thinking')) {
+            delete body.generationConfig.thinkingConfig;
+            resp = await fetch(url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+        } else throw new Error(eb.error?.message||'Erreur API');
+    }
+    if (!resp.ok) {
+        const err = await resp.json().catch(()=>({}));
+        if (resp.status===401||resp.status===403) throw new Error('Cle API invalide.');
+        throw new Error(err.error?.message||`Erreur ${resp.status}`);
+    }
+    const data = await resp.json();
+    const text = extractAnswer(data);
+    if (!text) throw new Error('Reponse vide.');
+    return extractJSON(text);
+}
+
+// ===================== PROMPTS =====================
+const IDENTIFY_PROMPT = `Tu es un expert botaniste et pedagogue. Identifie cette plante d'interieur.
+Renvoie UNIQUEMENT un JSON valide :
+{"name":"nom commun francais","commonNames":"noms populaires alternatifs","scientificName":"nom latin","wateringFrequency":7,"light":"faible","difficulty":"facile","tips":"Conseil 1. Conseil 2. Conseil 3.","winterFrequency":10,"summerFrequency":5,"waterAmount":"150-200ml (environ un verre)","waterTips":"Arroser quand le dessus du terreau est sec sur 2cm.","potSize":"petit"}
+
+Regles :
+- name : le nom commun le plus courant en francais (ex: "Monstera", "Ficus elastica", "Pothos")
+- commonNames : autres noms populaires, surnoms ou noms vernaculaires (ex: "Plante gruyere, Faux philodendron")
+- scientificName : nom latin complet avec variete si possible
+- wateringFrequency : jours entre arrosages (printemps/automne, base)
+- winterFrequency : jours en hiver (plus espace car repos)
+- summerFrequency : jours en ete (plus frequent car evaporation)
+- waterAmount : quantite d'eau en ml avec equivalent pratique (ex: "150ml (un verre)", "300ml (un petit arrosoir)")
+- waterTips : conseil CONCRET pour savoir quand arroser, en francais simple
+- potSize : "petit" (moins de 15cm), "moyen" (15-25cm), ou "grand" (plus de 25cm)
+- light : faible, moyen ou eleve
+- difficulty : facile, moyen ou difficile
+- tips : 3 conseils pratiques en francais separes par des points
+- UNIQUEMENT le JSON`;
+
+function makeReIdentifyPrompt(name, scientificName) {
+    return `Tu es un expert botaniste. On a precedemment identifie cette plante comme "${name}" (${scientificName}).
+Regarde attentivement cette photo. Es-tu confiant dans cette identification ?
+Renvoie UNIQUEMENT un JSON valide :
+{"confident":true,"confirmation":"Oui c'est bien un ${name}","suggestions":[{"name":"nom commun","commonNames":"autres noms","scientificName":"nom latin","confidence":90,"reason":"explication courte"}]}
+
+Regles :
+- confident : true si l'identification actuelle est correcte, false si tu penses que c'est autre chose
+- confirmation : si confident=true, une phrase confirmant l'identification
+- suggestions : liste de 1 a 3 identifications possibles par ordre de probabilite
+- La premiere suggestion DOIT etre celle que tu penses la plus probable
+- confidence : pourcentage de confiance (0-100)
+- reason : pourquoi tu penses que c'est cette plante (traits visibles)
+- Inclure l'identification actuelle dans les suggestions si tu penses qu'elle reste possible
+- UNIQUEMENT le JSON`;
+}
+
+function makeChatPrompt(plants) {
+    const ctx = plants.map(p => {
+        const rx = p.prescription ? ` [EN SOIN: ${p.prescription.instruction}]` : '';
+        return `- ${p.name} (${p.scientificName}), arrosage tous les ${p.wateringFrequency}j, lumiere: ${p.light}${rx}`;
+    }).join('\n');
+    return `Tu es un assistant jardinier expert, pedagogue et sympathique. Tu reponds en francais, de maniere claire et accessible aux debutants.
+
+Voici les plantes de l'utilisateur :
+${ctx || '(aucune plante enregistree)'}
+
+Reponds de maniere concise et utile. Si la question concerne une plante specifique de la liste, personnalise ta reponse. N'hesite pas a donner des conseils pratiques concrets.`;
+}
+
+const DOCTOR_PROMPT = `Tu es un docteur des plantes, pedagogue et bienveillant. Diagnostique le probleme visible.
+Renvoie UNIQUEMENT un JSON valide :
+{"diagnosis":"description du probleme","severity":"leger","causes":"Cause 1. Cause 2.","treatment":"Action 1. Action 2. Action 3.","urgency":"Agir rapidement","prescription":{"type":"reduire_arrosage","wateringMultiplier":1.5,"durationDays":14,"instruction":"Espacer les arrosages pendant 2 semaines"}}
+
+Regles pour prescription :
+- type : un parmi "reduire_arrosage", "augmenter_arrosage", "stop_arrosage", "brumiser", "aucune"
+- wateringMultiplier : multiplicateur (1.5 = arroser 50% moins souvent, 0.7 = 30% plus souvent)
+- durationDays : duree en jours
+- instruction : instruction claire, concrete, en francais simple
+- treatment : actions concretes accessibles a un debutant en francais simple
+- severity : leger, modere ou grave
+- UNIQUEMENT le JSON`;
+
+// ===================== MAIN APP =====================
+function App() {
+    const [plants, setPlants] = useState([]);
+    const [dbReady, setDbReady] = useState(false);
+    const [view, setView] = useState('list');
+    const [selPlant, setSelPlant] = useState(null);
+    const [loading, setLoading] = useState(false);
+    const [loadMsg, setLoadMsg] = useState('');
+    const [notif, setNotif] = useState(null);
+    const [doctorResult, setDoctorResult] = useState(null);
+    const [doctorForId, setDoctorForId] = useState(null);
+    const [reIdResult, setReIdResult] = useState(null);
+    const [chatMessages, setChatMessages] = useState([]);
+    const [chatInput, setChatInput] = useState('');
+    const [chatLoading, setChatLoading] = useState(false);
+    const fileRef = useRef(null);
+    const modeRef = useRef('identify');
+    const saveTimer = useRef(null);
+    const chatEndRef = useRef(null);
+    const season = getSeason();
+
+    // Load plants from IndexedDB on mount
+    useEffect(() => {
+        window.PlantDB.load().then(data => {
+            setPlants(data);
+            setDbReady(true);
+        }).catch(() => setDbReady(true));
+    }, []);
+
+    // Debounced save to IndexedDB when plants change
+    useEffect(() => {
+        if (!dbReady) return;
+        if (saveTimer.current) clearTimeout(saveTimer.current);
+        saveTimer.current = setTimeout(() => {
+            window.PlantDB.save(plants).then(ok => {
+                if (!ok) console.error('Save failed');
+            });
+        }, 300);
+    }, [plants, dbReady]);
+
+    // Clean expired prescriptions
+    useEffect(() => {
+        const has = plants.some(p => p.prescription && new Date(p.prescription.endDate) < new Date());
+        if (has) setPlants(prev => prev.map(p => {
+            if (p.prescription && new Date(p.prescription.endDate) < new Date()) { const {prescription,...r}=p; return r; }
+            return p;
+        }));
+    }, [view]);
+
+    useEffect(() => { if ('Notification' in window && Notification.permission==='default') Notification.requestPermission(); }, []);
+
+    function showNotif(msg,type='success') { setNotif({message:msg,type}); setTimeout(()=>setNotif(null),3500); }
+    function openInput(mode,pid) { modeRef.current=mode; setDoctorForId(pid||null); fileRef.current?.click(); }
+    function getDays(nw) { const t=new Date();t.setHours(0,0,0,0); return Math.ceil((new Date(nw+'T00:00:00')-t)/86400000); }
+
+    async function handleFile(e) {
+        const f=e.target.files[0]; if(!f) return; e.target.value='';
+        if (modeRef.current==='doctor') return handleDoctor(f);
+        return handleIdentify(f);
+    }
+
+    async function handleIdentify(file) {
+        setLoading(true); setLoadMsg('Identification en cours...');
+        try {
+            // Full quality for API identification
+            const apiB64 = await window.PhotoUtils.toBase64(file);
+            // Compressed for storage (~80KB instead of ~4MB)
+            const storeB64 = await window.PhotoUtils.compress(file, 800, 0.6);
+
+            const info = await callGemini(apiB64, file.type||'image/jpeg', IDENTIFY_PROMPT);
+            if (!info.name) throw new Error('Plante non reconnue.');
+            const base = Math.max(1,Math.round(Number(info.wateringFrequency)||7));
+            const af = adjFreq(base);
+            const next = new Date(); next.setDate(next.getDate()+af);
+            const np = {
+                id:Date.now(), name:info.name, scientificName:info.scientificName||'',
+                wateringFrequency:base,
+                winterFrequency:Math.max(1,Math.round(Number(info.winterFrequency)||Math.round(base*1.3))),
+                summerFrequency:Math.max(1,Math.round(Number(info.summerFrequency)||Math.round(base*0.7))),
+                light:info.light||'moyen', difficulty:info.difficulty||'moyen', tips:info.tips||'', commonNames:info.commonNames||'',
+                waterAmount:info.waterAmount||'', waterTips:info.waterTips||'', potSize:info.potSize||'moyen',
+                photo:storeB64, photoType:'image/jpeg',
+                addedDate:new Date().toISOString(),
+                nextWatering:next.toISOString().split('T')[0],
+                wateringHistory:[new Date().toISOString()]
+            };
+            setPlants(prev=>[...prev,np]); showNotif(`${info.name} ajoutee ! 🌱`);
+            setSelPlant(np); setView('detail');
+        } catch(err) { showNotif(err.message,'error'); setView('list'); }
+        finally { setLoading(false); }
+    }
+
+    async function handleDoctor(file) {
+        setLoading(true); setLoadMsg('Diagnostic en cours...');
+        try {
+            const apiB64 = await window.PhotoUtils.toBase64(file);
+            const storeB64 = await window.PhotoUtils.compress(file, 600, 0.5);
+            const r = await callGemini(apiB64, file.type||'image/jpeg', DOCTOR_PROMPT);
+            if (!r.diagnosis) throw new Error('Diagnostic impossible.');
+            r.photo = storeB64; r.photoType = 'image/jpeg';
+            setDoctorResult(r); setView('doctor-result');
+        } catch(err) { showNotif(err.message,'error'); }
+        finally { setLoading(false); }
+    }
+
+    function applyPrescription(plantId, prescription) {
+        if (!prescription || prescription.type==='aucune') { showNotif('Pas de modif necessaire.'); return; }
+        const end = new Date(); end.setDate(end.getDate()+(prescription.durationDays||14));
+        const rx = {
+            type:prescription.type, wateringMultiplier:prescription.wateringMultiplier||1.0,
+            noWatering:prescription.type==='stop_arrosage',
+            durationDays:prescription.durationDays||14, instruction:prescription.instruction||'',
+            diagnosis:doctorResult?.diagnosis||'', startDate:new Date().toISOString(), endDate:end.toISOString()
+        };
+        const plant = plants.find(p=>p.id===plantId);
+        if (!plant) return;
+        let nw;
+        if (rx.noWatering) { nw = end.toISOString().split('T')[0]; }
+        else { const f=Math.max(1,Math.round(plant.wateringFrequency*rx.wateringMultiplier)); const n=new Date();n.setDate(n.getDate()+f); nw=n.toISOString().split('T')[0]; }
+        setPlants(prev=>prev.map(p=>p.id!==plantId?p:{...p,prescription:rx,nextWatering:nw}));
+        setSelPlant(prev=>(!prev||prev.id!==plantId)?prev:{...prev,prescription:rx,nextWatering:nw});
+        showNotif('Prescription appliquee ! 🩺'); setView('detail');
+    }
+
+    function clearPrescription(plantId) {
+        setPlants(prev=>prev.map(p=>{
+            if(p.id!==plantId)return p;
+            const{prescription,...r}=p; const f=adjFreq(r.wateringFrequency); const n=new Date();n.setDate(n.getDate()+f);
+            return{...r,nextWatering:n.toISOString().split('T')[0]};
+        }));
+        setSelPlant(prev=>{
+            if(!prev||prev.id!==plantId)return prev;
+            const{prescription,...r}=prev; const f=adjFreq(r.wateringFrequency); const n=new Date();n.setDate(n.getDate()+f);
+            return{...r,nextWatering:n.toISOString().split('T')[0]};
+        });
+        showNotif('Soin termine, retour normal.');
+    }
+
+    const waterPlant = useCallback((id) => {
+        setPlants(prev=>prev.map(p=>{
+            if(p.id!==id)return p;
+            const f=getEffectiveFreq(p); const n=new Date();n.setDate(n.getDate()+f);
+            return{...p,nextWatering:n.toISOString().split('T')[0],wateringHistory:[...(p.wateringHistory||[]),new Date().toISOString()]};
+        }));
+        setSelPlant(prev=>{
+            if(!prev||prev.id!==id)return prev;
+            const f=getEffectiveFreq(prev); const n=new Date();n.setDate(n.getDate()+f);
+            return{...prev,nextWatering:n.toISOString().split('T')[0],wateringHistory:[...(prev.wateringHistory||[]),new Date().toISOString()]};
+        });
+        showNotif('Arrosage enregistre ! 💧');
+    }, [plants]);
+
+    const deletePlant = useCallback((id) => {
+        if(confirm('Supprimer ?')){setPlants(p=>p.filter(x=>x.id!==id));setSelPlant(null);setView('list');}
+    }, []);
+
+    // ===================== RE-IDENTIFY =====================
+    async function handleReIdentify(plant) {
+        setLoading(true); setLoadMsg('Verification en cours...');
+        try {
+            const prompt = makeReIdentifyPrompt(plant.name, plant.scientificName);
+            const r = await callGemini(plant.photo, plant.photoType||'image/jpeg', prompt);
+            setReIdResult(r); setView('reidentify');
+        } catch(err) { showNotif(err.message,'error'); }
+        finally { setLoading(false); }
+    }
+
+    function applySuggestion(plantId, suggestion) {
+        setPlants(prev=>prev.map(p=>{
+            if(p.id!==plantId) return p;
+            return {...p, name:suggestion.name, scientificName:suggestion.scientificName, commonNames:suggestion.commonNames||''};
+        }));
+        const updated = {...selPlant, name:suggestion.name, scientificName:suggestion.scientificName, commonNames:suggestion.commonNames||''};
+        setSelPlant(updated);
+        showNotif(`Identifie comme ${suggestion.name} !`);
+        setView('detail');
+    }
+
+    // ===================== CHAT =====================
+    async function callGeminiText(systemPrompt, userMessage) {
+        const apiKey = localStorage.getItem('gemini_api_key');
+        if (!apiKey) throw new Error('Configure ta cle API dans Reglages.');
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+        const body = {
+            contents:[{parts:[{text: systemPrompt + '\n\nQuestion: ' + userMessage}]}],
+            generationConfig:{temperature:0.7,maxOutputTokens:800,thinkingConfig:{thinkingBudget:0}}
+        };
+        let resp = await fetch(url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+        if (resp.status===400) {
+            delete body.generationConfig.thinkingConfig;
+            resp = await fetch(url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+        }
+        if (!resp.ok) throw new Error('Erreur API');
+        const data = await resp.json();
+        return extractAnswer(data) || 'Pas de reponse.';
+    }
+
+    async function sendChat() {
+        const msg = chatInput.trim(); if (!msg) return;
+        setChatInput('');
+        setChatMessages(prev=>[...prev, {role:'user',text:msg}]);
+        setChatLoading(true);
+        try {
+            const sys = makeChatPrompt(plants);
+            const answer = await callGeminiText(sys, msg);
+            setChatMessages(prev=>[...prev, {role:'assistant',text:answer}]);
+        } catch(err) {
+            setChatMessages(prev=>[...prev, {role:'assistant',text:'Erreur: '+err.message}]);
+        }
+        finally { setChatLoading(false); }
+    }
+
+    useEffect(()=>{ chatEndRef.current?.scrollIntoView({behavior:'smooth'}); }, [chatMessages]);
+
+    // Loading screen while DB loads
+    if (!dbReady) return (
+        <div className="flex items-center justify-center min-h-screen">
+            <div className="text-center"><div className="text-6xl mb-4 animate-bounce">🌱</div><div className="text-lg text-emerald-700">Chargement...</div></div>
+        </div>
+    );
+
+    // Show landing on first visit (no API key + no plants)
+    const isFirstVisit = !localStorage.getItem('gemini_api_key') && plants.length === 0 && !localStorage.getItem('onboarding_done');
+
+    if (isFirstVisit && view === 'list') return (
+        <div className="min-h-screen relative overflow-hidden">
+            {/* Background decoration */}
+            <div className="absolute inset-0 overflow-hidden pointer-events-none">
+                <div className="absolute -top-20 -right-20 w-64 h-64 bg-emerald-200/30 rounded-full blur-3xl"></div>
+                <div className="absolute top-1/3 -left-32 w-80 h-80 bg-teal-200/20 rounded-full blur-3xl"></div>
+                <div className="absolute bottom-20 right-10 w-48 h-48 bg-amber-200/20 rounded-full blur-3xl"></div>
+            </div>
+
+            <div className="relative max-w-lg mx-auto px-6 py-10">
+                {/* Hero */}
+                <div className="text-center mb-12">
+                    <div className="text-7xl mb-4">🌱</div>
+                    <h1 className="text-4xl font-black text-emerald-900 mb-3 leading-tight">Main Verte</h1>
+                    <p className="text-lg text-emerald-700/80">L'app qui te donne la main verte, meme si tu n'y connais rien</p>
+                </div>
+
+                {/* Features */}
+                <div className="space-y-4 mb-12">
+                    <div className="bg-white/80 backdrop-blur-sm rounded-2xl p-5 shadow-lg border border-emerald-100">
+                        <div className="flex items-start gap-4">
+                            <div className="w-12 h-12 bg-emerald-100 rounded-xl flex items-center justify-center text-2xl flex-shrink-0">📸</div>
+                            <div>
+                                <h3 className="font-bold text-gray-800 mb-1">Identifie tes plantes</h3>
+                                <p className="text-sm text-gray-600 leading-relaxed">Prends une photo, l'IA reconnait la plante et te donne ses besoins en arrosage, lumiere et entretien.</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="bg-white/80 backdrop-blur-sm rounded-2xl p-5 shadow-lg border border-blue-100">
+                        <div className="flex items-start gap-4">
+                            <div className="w-12 h-12 bg-blue-100 rounded-xl flex items-center justify-center text-2xl flex-shrink-0">💧</div>
+                            <div>
+                                <h3 className="font-bold text-gray-800 mb-1">Planning d'arrosage intelligent</h3>
+                                <p className="text-sm text-gray-600 leading-relaxed">L'app adapte la frequence selon la saison et te dit exactement quelle quantite d'eau utiliser. Fini le doute.</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="bg-white/80 backdrop-blur-sm rounded-2xl p-5 shadow-lg border border-amber-100">
+                        <div className="flex items-start gap-4">
+                            <div className="w-12 h-12 bg-amber-100 rounded-xl flex items-center justify-center text-2xl flex-shrink-0">🩺</div>
+                            <div>
+                                <h3 className="font-bold text-gray-800 mb-1">Docteur plante</h3>
+                                <p className="text-sm text-gray-600 leading-relaxed">Ta plante a mauvaise mine ? Photographie-la et recois un diagnostic, les causes et un traitement concret.</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="bg-white/80 backdrop-blur-sm rounded-2xl p-5 shadow-lg border border-purple-100">
+                        <div className="flex items-start gap-4">
+                            <div className="w-12 h-12 bg-purple-100 rounded-xl flex items-center justify-center text-2xl flex-shrink-0">💬</div>
+                            <div>
+                                <h3 className="font-bold text-gray-800 mb-1">Pose tes questions</h3>
+                                <p className="text-sm text-gray-600 leading-relaxed">Un assistant jardinier qui connait tes plantes et repond a toutes tes questions, meme les plus debutantes.</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Slack / Entreprise */}
+                <div className="bg-gradient-to-br from-purple-50 to-indigo-50 rounded-2xl p-5 shadow-lg border border-purple-200 mb-12">
+                    <div className="flex items-start gap-4">
+                        <div className="w-12 h-12 bg-purple-500 rounded-xl flex items-center justify-center text-2xl flex-shrink-0">💼</div>
+                        <div>
+                            <h3 className="font-bold text-purple-900 mb-1">Pour les entreprises</h3>
+                            <p className="text-sm text-purple-800/80 leading-relaxed">Connecte l'app a Slack pour recevoir un rappel d'arrosage chaque matin dans le channel de ton choix. Ideal pour les plantes du bureau.</p>
+                        </div>
+                    </div>
+                </div>
+
+                {/* How it works - detailed */}
+                <div className="mb-10">
+                    <h2 className="text-center font-bold text-emerald-800 text-lg mb-6">Comment demarrer ?</h2>
+
+                    {/* Step 1: API Key */}
+                    <div className="bg-white/80 backdrop-blur-sm rounded-2xl p-5 shadow-lg mb-4">
+                        <div className="flex items-center gap-3 mb-3">
+                            <div className="w-8 h-8 bg-emerald-500 text-white rounded-full flex items-center justify-center font-bold flex-shrink-0">1</div>
+                            <h3 className="font-bold text-gray-800">Obtenir ta cle API Gemini (gratuit)</h3>
+                        </div>
+                        <div className="ml-11 space-y-2 text-sm text-gray-600">
+                            <p>1. Va sur <a href="https://aistudio.google.com/app/apikey" target="_blank" className="text-emerald-600 underline font-semibold">Google AI Studio</a></p>
+                            <p>2. Connecte-toi avec ton compte Google</p>
+                            <p>3. Clique sur "Create API Key"</p>
+                            <p>4. Copie la cle qui commence par "AIza..."</p>
+                            <p>5. Colle-la dans les reglages de l'app</p>
+                            <div className="bg-emerald-50 rounded-lg p-3 mt-2">
+                                <p className="text-xs text-emerald-700">💡 L'offre gratuite permet ~1500 requetes/jour, largement suffisant pour un usage personnel ou d'equipe.</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Step 2: Scan */}
+                    <div className="bg-white/80 backdrop-blur-sm rounded-2xl p-5 shadow-lg mb-4">
+                        <div className="flex items-center gap-3 mb-3">
+                            <div className="w-8 h-8 bg-emerald-500 text-white rounded-full flex items-center justify-center font-bold flex-shrink-0">2</div>
+                            <h3 className="font-bold text-gray-800">Photographie tes plantes</h3>
+                        </div>
+                        <div className="ml-11 text-sm text-gray-600">
+                            <p>Appuie sur 📸, prends une photo, et l'IA identifie la plante, ses besoins en eau et lumiere, et te cree un planning d'arrosage adapte a la saison.</p>
+                        </div>
+                    </div>
+
+                    {/* Step 3: Slack (optional) */}
+                    <div className="bg-white/80 backdrop-blur-sm rounded-2xl p-5 shadow-lg mb-4">
+                        <div className="flex items-center gap-3 mb-3">
+                            <div className="w-8 h-8 bg-purple-500 text-white rounded-full flex items-center justify-center font-bold flex-shrink-0">3</div>
+                            <h3 className="font-bold text-gray-800">Connecter Slack <span className="text-xs font-normal text-gray-400">(optionnel)</span></h3>
+                        </div>
+                        <div className="ml-11 space-y-2 text-sm text-gray-600">
+                            <p className="font-semibold text-purple-800">Option A — Via Make.com (recommande) :</p>
+                            <p>1. Cree un compte sur <a href="https://www.make.com" target="_blank" className="text-purple-600 underline font-semibold">Make.com</a> (gratuit)</p>
+                            <p>2. Cree un scenario → ajoute un module "Webhook" comme trigger</p>
+                            <p>3. Ajoute un module "Slack → Send a Message" et connecte ton workspace</p>
+                            <p>4. Copie l'URL du webhook et colle-la dans ⚙️ Reglages → Webhook</p>
+                            <p>5. Pour un rappel quotidien automatique, ajoute un trigger "Schedule" a 8h du matin</p>
+
+                            <p className="font-semibold text-purple-800 mt-3">Option B — Slack direct :</p>
+                            <p>1. Va dans les parametres de ton workspace Slack</p>
+                            <p>2. Apps → Incoming Webhooks → Activer</p>
+                            <p>3. "Add New Webhook" → choisis le channel</p>
+                            <p>4. Copie l'URL et colle-la dans ⚙️ Reglages → Webhook</p>
+
+                            <div className="bg-purple-50 rounded-lg p-3 mt-2">
+                                <p className="text-xs text-purple-700">💡 Make.com est recommande car tu peux personnaliser le message, ajouter un planning, et declencher l'envoi automatiquement chaque matin.</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                {/* CTA */}
+                <div className="text-center space-y-3">
+                    <button onClick={()=>{localStorage.setItem('onboarding_done','1');setView('settings');}}
+                        className="w-full bg-emerald-500 text-white py-4 rounded-2xl font-bold text-lg shadow-xl shadow-emerald-500/30 active:scale-[0.98] transition-transform">
+                        🌱 Commencer
+                    </button>
+                    <p className="text-xs text-gray-400">Necessite une cle API Google Gemini gratuite</p>
+                </div>
+
+                {/* Footer */}
+                <div className="text-center mt-12 text-xs text-gray-400">
+                    <p>Main Verte v1.7 · Propulse par Gemini AI</p>
+                </div>
+            </div>
+        </div>
+    );
+
+    // ===================== LIST VIEW =====================
+    const ListView = () => (
+        <div className="fade-in">
+            <div className="bg-white/80 backdrop-blur-sm rounded-2xl shadow-lg p-4 mb-4 flex items-center justify-between">
+                <div>
+                    <h2 className="text-2xl font-bold text-emerald-800">Mes Plantes</h2>
+                    <p className="text-emerald-600 text-sm">{plants.length} plante{plants.length>1?'s':''}</p>
+                </div>
+                <div className="text-right">
+                    <div className="text-2xl">{season.icon}</div>
+                    <div className="text-xs text-gray-500 font-semibold">{season.name}</div>
+                </div>
+            </div>
+
+            <button onClick={()=>openInput('doctor',null)} className="w-full bg-gradient-to-r from-amber-500 to-orange-500 text-white py-3 rounded-2xl font-semibold shadow-lg mb-4 flex items-center justify-center gap-2">
+                🩺 Docteur plante
+            </button>
+
+            {plants.length===0 ? (
+                <div className="text-center py-12">
+                    <div className="text-6xl mb-4">🌱</div>
+                    <p className="text-gray-600 mb-6">Aucune plante</p>
+                    <button onClick={()=>openInput('identify')} className="bg-emerald-500 text-white px-8 py-3 rounded-full font-semibold shadow-lg">Ajouter ma premiere plante</button>
+                </div>
+            ) : (
+                <div className="space-y-4">
+                    {plants.map(plant => {
+                        const days=getDays(plant.nextWatering); const rx=getActivePrescription(plant); const rl=rxDaysLeft(plant);
+                        return (
+                            <div key={plant.id} onClick={()=>{setSelPlant(plant);setView('detail');}} className="plant-card bg-white rounded-2xl shadow-lg overflow-hidden cursor-pointer">
+                                <div className="flex items-center p-4">
+                                    <div className="relative">
+                                        {plant.photo ? <img src={`data:${plant.photoType};base64,${plant.photo}`} className="w-20 h-20 rounded-xl object-cover" alt="" /> : <div className="w-20 h-20 rounded-xl bg-emerald-100 flex items-center justify-center text-3xl">🌱</div>}
+                                        {rx && <div className="absolute -top-1 -right-1 w-6 h-6 bg-amber-500 rounded-full flex items-center justify-center text-xs pulse-care">🩺</div>}
+                                    </div>
+                                    <div className="ml-4 flex-1">
+                                        <h3 className="font-bold text-lg text-gray-800">{plant.name}</h3>
+                                        <p className="text-sm text-gray-500 italic">{plant.scientificName}</p>
+                                        <div className="mt-2 flex items-center gap-2 flex-wrap">
+                                            <span className={`text-xs px-3 py-1 rounded-full font-semibold ${days<=0?'bg-red-500 text-white':days<=2?'bg-orange-500 text-white':'bg-emerald-500 text-white'}`}>
+                                                {days<=0?(days===0?"Aujourd'hui 💧":`Retard ${Math.abs(days)}j`):`Dans ${days}j`}
+                                            </span>
+                                            {rx && <span className="text-xs px-2 py-1 rounded-full bg-amber-100 text-amber-800 font-semibold">🩺 {rl}j</span>}
+                                            {!rx && plant.waterAmount && <span className="text-xs text-blue-500">💧 {plant.waterAmount.split('(')[0].trim()}</span>}
+                                        </div>
+                                    </div>
+                                    <div className="text-2xl text-gray-300">›</div>
+                                </div>
+                            </div>
+                        );
+                    })}
+                </div>
+            )}
+        </div>
+    );
+
+    // ===================== DETAIL VIEW =====================
+    const DetailView = () => {
+        if (!selPlant) return null;
+        const days=getDays(selPlant.nextWatering); const [jw,setJw]=useState(false);
+        const rx=getActivePrescription(selPlant); const rl=rxDaysLeft(selPlant); const ef=getEffectiveFreq(selPlant);
+        const doWater=()=>{waterPlant(selPlant.id);setJw(true);setTimeout(()=>setJw(false),2000);};
+
+        return (
+            <div className="fade-in">
+                <button onClick={()=>setView('list')} className="mb-4 text-emerald-600 font-semibold">← Retour</button>
+                <div className="bg-white rounded-2xl shadow-lg overflow-hidden mb-6">
+                    {selPlant.photo && <img src={`data:${selPlant.photoType};base64,${selPlant.photo}`} className="w-full h-64 object-cover" alt="" />}
+                    <div className="p-6">
+                        <h2 className="text-3xl font-bold text-gray-800 mb-1">{selPlant.name}</h2>
+                        <p className="text-gray-500 italic">{selPlant.scientificName}</p>
+                        {selPlant.commonNames && <p className="text-gray-400 text-sm mb-2">Aussi appele : {selPlant.commonNames}</p>}
+                        <button onClick={()=>handleReIdentify(selPlant)} className="text-xs text-indigo-500 underline mb-4 inline-block">🔄 Verifier l'identification</button>
+
+                        {/* PRESCRIPTION BANNER */}
+                        {rx && (
+                            <div className="bg-amber-50 border-2 border-amber-300 rounded-xl p-4 mb-4">
+                                <div className="flex items-center justify-between mb-2">
+                                    <div className="flex items-center gap-2"><span className="text-xl pulse-care">🩺</span><span className="font-bold text-amber-800">En soin</span></div>
+                                    <span className="text-xs bg-amber-200 text-amber-800 px-2 py-1 rounded-full font-bold">{rl}j restants</span>
+                                </div>
+                                <p className="text-sm text-amber-700 mb-1"><strong>Diagnostic :</strong> {rx.diagnosis}</p>
+                                <p className="text-sm text-amber-700 mb-2"><strong>Prescription :</strong> {rx.instruction}</p>
+                                <div className="flex gap-2 mb-3">
+                                    <div className="flex-1 bg-amber-100 rounded-lg p-2 text-center">
+                                        <div className="text-xs text-amber-600">Frequence temp.</div>
+                                        <div className="font-bold text-amber-800 text-sm">{rx.noWatering?'Stop':ef+'j'}</div>
+                                    </div>
+                                    <div className="flex-1 bg-amber-100 rounded-lg p-2 text-center">
+                                        <div className="text-xs text-amber-600">Fin le</div>
+                                        <div className="font-bold text-amber-800 text-sm">{new Date(rx.endDate).toLocaleDateString('fr-FR',{day:'numeric',month:'short'})}</div>
+                                    </div>
+                                </div>
+                                <button onClick={()=>clearPrescription(selPlant.id)} className="w-full py-2 rounded-lg text-sm font-semibold bg-white text-amber-700 border border-amber-300">Terminer le soin</button>
+                            </div>
+                        )}
+
+                        <div className="grid grid-cols-3 gap-3 mb-4">
+                            <div className="bg-blue-50 rounded-lg p-3 text-center"><div className="text-2xl mb-1">☀️</div><div className="text-xs text-gray-600">Lumiere</div><div className="font-semibold text-sm capitalize">{selPlant.light}</div></div>
+                            <div className="bg-emerald-50 rounded-lg p-3 text-center">
+                                <div className="text-2xl mb-1">💧</div><div className="text-xs text-gray-600">Arrosage</div>
+                                <div className="font-semibold text-sm">{rx?<span className="text-amber-600">{rx.noWatering?'Stop':ef+'j'} 🩺</span>:ef+'j'}</div>
+                            </div>
+                            <div className="bg-purple-50 rounded-lg p-3 text-center"><div className="text-2xl mb-1">🎯</div><div className="text-xs text-gray-600">Difficulte</div><div className="font-semibold text-sm capitalize">{selPlant.difficulty}</div></div>
+                        </div>
+
+                        {/* WATER QUANTITY - pedagogic section */}
+                        {(selPlant.waterAmount || selPlant.waterTips) && (
+                            <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 mb-4">
+                                <h3 className="font-bold text-blue-800 mb-2">💧 Comment arroser ?</h3>
+                                {selPlant.waterAmount && (
+                                    <div className="flex items-center gap-3 mb-3">
+                                        <div className="bg-blue-500 text-white rounded-full w-14 h-14 flex items-center justify-center text-lg font-bold flex-shrink-0">
+                                            {selPlant.waterAmount.match(/\d+/)?.[0] || '?'}
+                                            <span className="text-xs">ml</span>
+                                        </div>
+                                        <div>
+                                            <div className="font-semibold text-blue-800">{selPlant.waterAmount}</div>
+                                            <div className="text-xs text-blue-600">Pot {selPlant.potSize || 'moyen'} — ajuster selon la taille</div>
+                                        </div>
+                                    </div>
+                                )}
+                                {selPlant.waterTips && <p className="text-sm text-blue-700 leading-relaxed">{selPlant.waterTips}</p>}
+                            </div>
+                        )}
+
+                        {/* Season frequencies */}
+                        {!rx && (
+                            <div className="bg-gray-50 rounded-xl p-3 mb-4">
+                                <div className="text-xs font-bold text-gray-600 mb-2">📅 Arrosage selon la saison</div>
+                                <div className="grid grid-cols-4 gap-2 text-center text-xs">
+                                    <div className={`rounded-lg p-2 ${season.name==='Printemps'?'bg-emerald-200 font-bold':'bg-white'}`}>
+                                        <div>🌸</div><div>{Math.round(selPlant.wateringFrequency*0.85)}j</div><div className="text-gray-400 mt-1">+ frequent</div>
+                                    </div>
+                                    <div className={`rounded-lg p-2 ${season.name==='Ete'?'bg-emerald-200 font-bold':'bg-white'}`}>
+                                        <div>☀️</div><div>{selPlant.summerFrequency||Math.round(selPlant.wateringFrequency*0.7)}j</div><div className="text-gray-400 mt-1">++ frequent</div>
+                                    </div>
+                                    <div className={`rounded-lg p-2 ${season.name==='Automne'?'bg-emerald-200 font-bold':'bg-white'}`}>
+                                        <div>🍂</div><div>{selPlant.wateringFrequency}j</div><div className="text-gray-400 mt-1">normal</div>
+                                    </div>
+                                    <div className={`rounded-lg p-2 ${season.name==='Hiver'?'bg-emerald-200 font-bold':'bg-white'}`}>
+                                        <div>❄️</div><div>{selPlant.winterFrequency||Math.round(selPlant.wateringFrequency*1.3)}j</div><div className="text-gray-400 mt-1">+ espace</div>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Next watering */}
+                        <div className={`rounded-xl p-4 mb-4 ${days<=0?'bg-red-50 border-2 border-red-200':days<=2?'bg-orange-50 border-2 border-orange-200':'bg-emerald-50'}`}>
+                            <h3 className="font-bold text-gray-800 mb-1">Prochain arrosage</h3>
+                            <div className={`text-2xl font-bold ${days<=0?'text-red-600':days<=2?'text-orange-600':'text-emerald-600'}`}>
+                                {rx&&rx.noWatering ? "⛔ Pas d'arrosage (soin)" :
+                                 days===0?"Aujourd'hui ! 💧":days<0?`En retard de ${Math.abs(days)}j !`:`Dans ${days} jour${days>1?'s':''}`}
+                            </div>
+                            <div className="text-sm text-gray-500 mt-1">{new Date(selPlant.nextWatering+'T00:00:00').toLocaleDateString('fr-FR',{weekday:'long',day:'numeric',month:'long'})}</div>
+                        </div>
+
+                        {!(rx&&rx.noWatering) && (
+                            <button onClick={doWater} className={`w-full py-3 rounded-xl font-semibold shadow-lg mb-3 ${jw?'bg-emerald-500 text-white':'bg-blue-500 text-white'}`}>
+                                {jw ? '✅ Arrose !' : "💧 J'ai arrose cette plante"}
+                            </button>
+                        )}
+
+                        <button onClick={()=>openInput('doctor',selPlant.id)} className="w-full py-3 rounded-xl font-semibold bg-amber-100 text-amber-800 mb-3">🩺 Ma plante a un probleme</button>
+
+                        <div className="bg-gray-50 rounded-xl p-4 mb-4"><h3 className="font-bold text-gray-800 mb-2">💡 Conseils</h3><p className="text-gray-700 text-sm leading-relaxed">{selPlant.tips}</p></div>
+
+                        {selPlant.wateringHistory?.length>0 && (
+                            <div className="bg-gray-50 rounded-xl p-4 mb-4">
+                                <h3 className="font-bold text-gray-800 mb-2">📅 Historique ({selPlant.wateringHistory.length})</h3>
+                                {selPlant.wateringHistory.slice(-5).reverse().map((d,i)=>(
+                                    <div key={i} className="text-sm text-gray-600">💧 {new Date(d).toLocaleDateString('fr-FR',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'})}</div>
+                                ))}
+                            </div>
+                        )}
+                        <button onClick={()=>deletePlant(selPlant.id)} className="w-full bg-red-500 text-white py-2 rounded-xl font-semibold">Supprimer</button>
+                    </div>
+                </div>
+            </div>
+        );
+    };
+
+    // ===================== DOCTOR RESULT VIEW =====================
+    const DoctorResultView = () => {
+        if (!doctorResult) return null;
+        const sc={leger:{bg:'bg-yellow-50',bd:'border-yellow-300',tx:'text-yellow-800',badge:'bg-yellow-200'},modere:{bg:'bg-orange-50',bd:'border-orange-300',tx:'text-orange-800',badge:'bg-orange-200'},grave:{bg:'bg-red-50',bd:'border-red-300',tx:'text-red-800',badge:'bg-red-200'}};
+        const s=sc[doctorResult.severity]||sc.modere;
+        const rx=doctorResult.prescription; const linked=doctorForId?plants.find(p=>p.id===doctorForId):null; const hasRx=rx&&rx.type!=='aucune';
+
+        return (
+            <div className="fade-in">
+                <button onClick={()=>{if(linked){setSelPlant(linked);setView('detail');}else setView('list');}} className="mb-4 text-emerald-600 font-semibold">← Retour</button>
+                <div className="bg-white rounded-2xl shadow-lg overflow-hidden mb-6">
+                    {doctorResult.photo && <img src={`data:${doctorResult.photoType};base64,${doctorResult.photo}`} className="w-full h-48 object-cover" alt="" />}
+                    <div className="p-6">
+                        <div className="flex items-center gap-3 mb-4">
+                            <span className="text-3xl">🩺</span>
+                            <div>
+                                <h2 className="text-2xl font-bold text-gray-800">Diagnostic</h2>
+                                <div className="flex items-center gap-2 mt-1">
+                                    <span className={`text-xs px-3 py-1 rounded-full font-bold ${s.badge} ${s.tx}`}>
+                                        {doctorResult.severity==='leger'?'🟡 Leger':doctorResult.severity==='grave'?'🔴 Grave':'🟠 Modere'}
+                                    </span>
+                                    {linked && <span className="text-xs text-gray-500">pour {linked.name}</span>}
+                                </div>
+                            </div>
+                        </div>
+                        <div className={`${s.bg} border-2 ${s.bd} rounded-xl p-4 mb-4`}><p className={`font-semibold ${s.tx}`}>{doctorResult.diagnosis}</p></div>
+                        <div className="bg-amber-50 rounded-xl p-4 mb-4"><h3 className="font-bold text-amber-800 mb-2">⏰ Urgence</h3><p className="text-amber-700 text-sm">{doctorResult.urgency}</p></div>
+                        <div className="bg-gray-50 rounded-xl p-4 mb-4"><h3 className="font-bold text-gray-800 mb-2">🔍 Causes</h3><p className="text-gray-700 text-sm leading-relaxed">{doctorResult.causes}</p></div>
+                        <div className="bg-emerald-50 rounded-xl p-4 mb-4"><h3 className="font-bold text-emerald-800 mb-2">💊 Traitement</h3><p className="text-emerald-700 text-sm leading-relaxed">{doctorResult.treatment}</p></div>
+
+                        {hasRx && (
+                            <div className="bg-blue-50 border-2 border-blue-200 rounded-xl p-4 mb-4">
+                                <h3 className="font-bold text-blue-800 mb-2">📋 Prescription d'arrosage</h3>
+                                <p className="text-sm text-blue-700 mb-2">{rx.instruction}</p>
+                                <div className="flex gap-2 text-xs mb-3">
+                                    <span className="bg-blue-100 text-blue-700 px-2 py-1 rounded-lg font-semibold">
+                                        {rx.type==='stop_arrosage'?'⛔ Stop':rx.type==='reduire_arrosage'?'⬇️ Reduire':rx.type==='augmenter_arrosage'?'⬆️ Augmenter':'💨 Brumiser'}
+                                    </span>
+                                    <span className="bg-blue-100 text-blue-700 px-2 py-1 rounded-lg font-semibold">{rx.durationDays||14}j</span>
+                                </div>
+                                {linked ? (
+                                    <button onClick={()=>applyPrescription(linked.id,rx)} className="w-full bg-blue-500 text-white py-3 rounded-xl font-semibold shadow-lg">
+                                        ✅ Appliquer a {linked.name}
+                                    </button>
+                                ) : plants.length > 0 ? (
+                                    <div>
+                                        <p className="text-xs text-blue-600 mb-2 font-semibold">Appliquer a quelle plante ?</p>
+                                        <div className="space-y-2">
+                                            {plants.map(p=>(
+                                                <button key={p.id} onClick={()=>applyPrescription(p.id,rx)} className="w-full bg-white border border-blue-200 text-blue-700 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 px-3">
+                                                    {p.photo?<img src={`data:${p.photoType};base64,${p.photo}`} className="w-8 h-8 rounded-lg object-cover" alt="" />:<span>🌱</span>}
+                                                    {p.name}
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </div>
+                                ) : <p className="text-xs text-gray-400">Ajoute d'abord une plante pour appliquer la prescription</p>}
+                            </div>
+                        )}
+                        {!hasRx && <div className="bg-gray-50 rounded-xl p-4 mb-4 text-center"><p className="text-sm text-gray-500">✅ Pas de modif d'arrosage necessaire</p></div>}
+                        <button onClick={()=>openInput('doctor',doctorForId)} className="w-full bg-amber-500 text-white py-3 rounded-xl font-semibold">🩺 Nouveau diagnostic</button>
+                    </div>
+                </div>
+            </div>
+        );
+    };
+
+    // ===================== RE-IDENTIFY VIEW =====================
+    const ReIdentifyView = () => {
+        if (!reIdResult || !selPlant) return null;
+        const suggestions = reIdResult.suggestions || [];
+        return (
+            <div className="fade-in">
+                <button onClick={()=>setView('detail')} className="mb-4 text-emerald-600 font-semibold">← Retour</button>
+                <div className="bg-white rounded-2xl shadow-lg overflow-hidden mb-6">
+                    {selPlant.photo && <img src={`data:${selPlant.photoType};base64,${selPlant.photo}`} className="w-full h-48 object-cover" alt="" />}
+                    <div className="p-6">
+                        <h2 className="text-2xl font-bold text-gray-800 mb-4">🔄 Verification</h2>
+
+                        {reIdResult.confident ? (
+                            <div className="bg-emerald-50 border-2 border-emerald-200 rounded-xl p-4 mb-4">
+                                <div className="flex items-center gap-2 mb-2"><span className="text-xl">✅</span><span className="font-bold text-emerald-800">Identification confirmee</span></div>
+                                <p className="text-sm text-emerald-700">{reIdResult.confirmation || `C'est bien un ${selPlant.name}.`}</p>
+                            </div>
+                        ) : (
+                            <div className="bg-orange-50 border-2 border-orange-200 rounded-xl p-4 mb-4">
+                                <div className="flex items-center gap-2 mb-2"><span className="text-xl">🤔</span><span className="font-bold text-orange-800">Doute sur l'identification</span></div>
+                                <p className="text-sm text-orange-700">Gemini propose d'autres possibilites. Choisis celle qui correspond :</p>
+                            </div>
+                        )}
+
+                        <div className="space-y-3">
+                            {suggestions.map((s, i) => (
+                                <div key={i} className={`rounded-xl p-4 border-2 ${s.name===selPlant.name?'border-emerald-300 bg-emerald-50':'border-gray-200 bg-white'}`}>
+                                    <div className="flex items-center justify-between mb-2">
+                                        <div>
+                                            <div className="font-bold text-gray-800">{s.name}</div>
+                                            <div className="text-sm text-gray-500 italic">{s.scientificName}</div>
+                                            {s.commonNames && <div className="text-xs text-gray-400">{s.commonNames}</div>}
+                                        </div>
+                                        <div className={`text-lg font-bold ${s.confidence>=80?'text-emerald-600':s.confidence>=50?'text-orange-600':'text-red-500'}`}>
+                                            {s.confidence}%
+                                        </div>
+                                    </div>
+                                    <p className="text-xs text-gray-600 mb-3">{s.reason}</p>
+                                    {s.name !== selPlant.name ? (
+                                        <button onClick={()=>applySuggestion(selPlant.id, s)} className="w-full bg-indigo-500 text-white py-2 rounded-lg font-semibold text-sm">
+                                            Choisir {s.name}
+                                        </button>
+                                    ) : (
+                                        <div className="text-center text-xs text-emerald-600 font-semibold">✅ Identification actuelle</div>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        );
+    };
+
+    const chatQuickQ = [
+        'Comment savoir si j\'arrose trop ?',
+        'Quelles plantes pour une piece sombre ?',
+        'Je pars en vacances 10 jours, que faire ?',
+        'Pourquoi les feuilles jaunissent ?'
+    ];
+
+    // ===================== CALENDAR VIEW =====================
+    const CalendarView = () => {
+        const events=plants.map(p=>({plant:p,days:getDays(p.nextWatering),rx:getActivePrescription(p)})).sort((a,b)=>a.days-b.days);
+        return (
+            <div className="fade-in">
+                <div className="bg-white/80 backdrop-blur-sm rounded-2xl shadow-lg p-4 mb-4">
+                    <h2 className="text-2xl font-bold text-emerald-800">Planning</h2>
+                    <p className="text-emerald-600 text-sm">{season.icon} {season.name} — {season.desc}</p>
+                </div>
+                {events.length===0 ? (
+                    <div className="text-center py-12 text-gray-400"><div className="text-5xl mb-4">📅</div><p>Ajoute une plante</p></div>
+                ) : (
+                    <div className="space-y-3">
+                        {events.map(({plant,days,rx})=>(
+                            <div key={plant.id} className={`rounded-xl shadow-lg overflow-hidden ${days<=0?'bg-red-50 border-2 border-red-300':days<=2?'bg-orange-50 border-2 border-orange-300':'bg-white'}`}>
+                                <div className="flex items-center p-4">
+                                    <div className="flex items-center gap-3 flex-1 cursor-pointer" onClick={()=>{setSelPlant(plant);setView('detail');}}>
+                                        <div className="relative">
+                                            {plant.photo?<img src={`data:${plant.photoType};base64,${plant.photo}`} className="w-12 h-12 rounded-lg object-cover" alt="" />:<div className="w-12 h-12 rounded-lg bg-emerald-100 flex items-center justify-center">🌱</div>}
+                                            {rx&&<div className="absolute -top-1 -right-1 w-5 h-5 bg-amber-500 rounded-full flex items-center justify-center text-xs pulse-care">🩺</div>}
+                                        </div>
+                                        <div>
+                                            <div className="font-bold text-gray-800">{plant.name}</div>
+                                            <div className="text-xs text-gray-500">
+                                                {rx?<span className="text-amber-600">🩺 En soin · {getEffectiveFreq(plant)}j</span>:
+                                                <span>{new Date(plant.nextWatering+'T00:00:00').toLocaleDateString('fr-FR',{day:'numeric',month:'short'})}
+                                                {plant.waterAmount && <span className="ml-1 text-blue-400">· {plant.waterAmount.split('(')[0].trim()}</span>}
+                                                </span>}
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div className="flex items-center gap-2">
+                                        <span className={`text-xs font-bold ${days<=0?'text-red-600':days<=2?'text-orange-600':'text-gray-500'}`}>
+                                            {rx&&rx.noWatering?'⛔':days<=0?(days===0?"Auj.":"Retard"):`${days}j`}
+                                        </span>
+                                        {days<=0&&!(rx&&rx.noWatering)&&<button onClick={(e)=>{e.stopPropagation();waterPlant(plant.id);}} className="bg-blue-500 text-white text-xs px-3 py-2 rounded-lg font-bold">💧</button>}
+                                    </div>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                )}
+            </div>
+        );
+    };
+
+    // ===================== SETTINGS VIEW =====================
+    const SettingsView = () => {
+        const [ak,setAk]=useState(localStorage.getItem('gemini_api_key')||'');
+        const [sk,setSk]=useState(false);
+        const [np,setNp]=useState('Notification' in window?Notification.permission:'unsupported');
+        const [diag,setDiag]=useState(null);
+        const [webhookUrl,setWebhookUrl]=useState(localStorage.getItem('webhook_url')||'');
+        const [webhookTest,setWebhookTest]=useState(null);
+        const withRx=plants.filter(p=>getActivePrescription(p));
+
+        // Full notification diagnostic
+        async function runDiagnostic() {
+            const d = {};
+            d.browser = navigator.userAgent.includes('Chrome') ? 'Chrome' : navigator.userAgent.includes('Firefox') ? 'Firefox' : 'Autre';
+            d.notifApi = 'Notification' in window ? '✅' : '❌ Non supporte';
+            d.permission = 'Notification' in window ? Notification.permission : 'N/A';
+            d.swApi = 'serviceWorker' in navigator ? '✅' : '❌ Non supporte';
+            d.swRegistered = '...';
+            d.periodicSync = '...';
+            d.isInstalled = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone ? '✅ Installee' : '❌ Non installee (ouverte dans navigateur)';
+
+            try {
+                const reg = await navigator.serviceWorker.getRegistration();
+                if (reg) {
+                    d.swRegistered = '✅ Actif (scope: ' + reg.scope + ')';
+                    d.swState = reg.active ? '✅ active' : reg.waiting ? '⏳ waiting' : reg.installing ? '⏳ installing' : '❌ aucun';
+                    if ('periodicSync' in reg) {
+                        const tags = await reg.periodicSync.getTags();
+                        d.periodicSync = tags.includes('check-watering') ? '✅ Enregistre' : '❌ Non enregistre';
+                        d.periodicSyncApi = '✅ Supporte';
+                    } else {
+                        d.periodicSync = '❌ Non supporte par ce navigateur';
+                        d.periodicSyncApi = '❌';
+                    }
+                } else {
+                    d.swRegistered = '❌ Non enregistre';
+                    d.periodicSync = '❌ (pas de SW)';
+                }
+            } catch(e) { d.swRegistered = '❌ Erreur: '+e.message; }
+
+            try {
+                const permPs = await navigator.permissions.query({name:'periodic-background-sync'});
+                d.periodicSyncPerm = permPs.state;
+            } catch(e) { d.periodicSyncPerm = 'N/A (non supporte)'; }
+
+            d.indexedDB = window.indexedDB ? '✅' : '❌';
+            setDiag(d);
+        }
+
+        // Test push notification
+        async function testNotification() {
+            if (!('Notification' in window)) { showNotif('Notifications non supportees','error'); return; }
+            if (Notification.permission !== 'granted') {
+                const p = await Notification.requestPermission();
+                setNp(p);
+                if (p !== 'granted') { showNotif('Permission refusee','error'); return; }
+            }
+            try {
+                const reg = await navigator.serviceWorker.getRegistration();
+                if (reg) {
+                    await reg.showNotification('🌱 Test Main Verte', {
+                        body: 'Si tu vois ceci, les notifications fonctionnent !',
+                        icon: '/icon-192.png', badge: '/icon-192.png', tag: 'test-notif'
+                    });
+                    showNotif('Notification envoyee via SW !');
+                } else {
+                    new Notification('🌱 Test Main Verte', {
+                        body: 'Notification basique OK. SW non actif.',
+                        icon: '/icon-192.png'
+                    });
+                    showNotif('Notification basique OK (pas de SW)');
+                }
+            } catch(e) { showNotif('Erreur: '+e.message,'error'); }
+        }
+
+        // Test webhook
+        async function testWebhook() {
+            const url = webhookUrl.trim();
+            if (!url) { showNotif('Ajoute une URL de webhook','error'); return; }
+            setWebhookTest('loading');
+            try {
+                const today = new Date();
+                const need = plants.filter(p => {
+                    if (p.prescription && new Date(p.prescription.endDate)>new Date() && p.prescription.noWatering) return false;
+                    return new Date(p.nextWatering+'T00:00:00') <= today;
+                });
+                const payload = {
+                    type: 'test',
+                    app: 'Main Verte',
+                    date: today.toISOString(),
+                    total_plants: plants.length,
+                    plants_to_water: need.length,
+                    plants: need.map(p => ({name:p.name,days_overdue:getDays(p.nextWatering)*-1,water_amount:p.waterAmount||''})),
+                    all_plants: plants.map(p => ({name:p.name,next_watering:p.nextWatering,water_amount:p.waterAmount||''}))
+                };
+                const resp = await fetch(url, {
+                    method:'POST', headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify(payload)
+                });
+                if (resp.ok || resp.type === 'opaque') {
+                    setWebhookTest('ok');
+                    showNotif('Webhook envoye ! Verifie Slack/Make');
+                } else {
+                    setWebhookTest('error');
+                    showNotif(`Webhook erreur ${resp.status}`,'error');
+                }
+            } catch(e) {
+                setWebhookTest('error');
+                showNotif('Erreur: '+e.message,'error');
+            }
+        }
+
+        return (
+            <div className="fade-in">
+                <div className="bg-white/80 backdrop-blur-sm rounded-2xl shadow-lg p-6 mb-6"><h2 className="text-2xl font-bold text-emerald-800">Parametres ⚙️</h2></div>
+
+                {withRx.length>0&&(
+                    <div className="bg-amber-50 border-2 border-amber-200 rounded-2xl shadow-lg p-4 mb-4">
+                        <h3 className="font-bold text-amber-800 mb-2">🩺 Soins en cours ({withRx.length})</h3>
+                        {withRx.map(p=>{const rx=getActivePrescription(p);const dl=rxDaysLeft(p);return(
+                            <div key={p.id} className="flex items-center justify-between py-2 border-b border-amber-100 last:border-0">
+                                <div><div className="font-semibold text-sm">{p.name}</div><div className="text-xs text-amber-600">{rx.instruction} · {dl}j</div></div>
+                                <button onClick={()=>clearPrescription(p.id)} className="text-xs bg-white border border-amber-300 text-amber-700 px-2 py-1 rounded-lg font-semibold">Terminer</button>
+                            </div>
+                        );})}
+                    </div>
+                )}
+
+                {/* NOTIFICATIONS */}
+                <div className="bg-white rounded-2xl shadow-lg p-6 mb-4">
+                    <h3 className="font-bold text-gray-800 mb-3">🔔 Notifications push</h3>
+                    <div className="p-3 bg-gray-50 rounded-xl mb-3">
+                        <div className="flex justify-between text-sm mb-1">
+                            <span className="text-gray-600">Permission :</span>
+                            <span className="font-bold">{np==='granted'?'✅ Activees':np==='denied'?'🚫 Bloquees':'⏸️ Non configurees'}</span>
+                        </div>
+                        <div className="flex justify-between text-sm">
+                            <span className="text-gray-600">PWA installee :</span>
+                            <span className="font-bold">{(window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone)?'✅ Oui':'❌ Non'}</span>
+                        </div>
+                    </div>
+                    {np!=='granted'&&np!=='unsupported'&&(
+                        <button onClick={async()=>{const p=await Notification.requestPermission();setNp(p);if(p==='granted')showNotif('Activees !');}} className="w-full bg-blue-500 text-white py-3 rounded-xl font-semibold mb-2">🔔 Activer les notifications</button>
+                    )}
+                    <div className="flex gap-2">
+                        <button onClick={testNotification} className="flex-1 bg-indigo-500 text-white py-2 rounded-xl font-semibold text-sm">🧪 Tester la notification</button>
+                        <button onClick={runDiagnostic} className="flex-1 bg-gray-200 text-gray-700 py-2 rounded-xl font-semibold text-sm">🔍 Diagnostic</button>
+                    </div>
+
+                    {diag && (
+                        <div className="mt-3 p-3 bg-gray-50 rounded-xl text-xs space-y-1 font-mono">
+                            <div className="font-bold text-gray-800 mb-2 font-sans text-sm">Diagnostic complet :</div>
+                            <div>Navigateur : {diag.browser}</div>
+                            <div>API Notification : {diag.notifApi}</div>
+                            <div>Permission : {diag.permission}</div>
+                            <div>Service Worker API : {diag.swApi}</div>
+                            <div>SW enregistre : {diag.swRegistered}</div>
+                            <div>SW state : {diag.swState || 'N/A'}</div>
+                            <div>PWA installee : {diag.isInstalled}</div>
+                            <div>Periodic Sync API : {diag.periodicSyncApi || 'N/A'}</div>
+                            <div>Periodic Sync enregistre : {diag.periodicSync}</div>
+                            <div>Periodic Sync permission : {diag.periodicSyncPerm || 'N/A'}</div>
+                            <div>IndexedDB : {diag.indexedDB}</div>
+                            <div className="pt-2 font-sans text-gray-500">
+                                {diag.permission!=='granted' && <p>→ Active les notifications d'abord</p>}
+                                {diag.isInstalled?.includes('❌') && <p>→ Installe la PWA depuis le menu Chrome {">"} "Ajouter a l'ecran d'accueil"</p>}
+                                {diag.periodicSync?.includes('❌') && diag.isInstalled?.includes('✅') && <p>→ Periodic Sync non supporte. Les notifications ne fonctionneront qu'a l'ouverture de l'app. Utilise le webhook Slack ci-dessous pour des rappels fiables.</p>}
+                            </div>
+                        </div>
+                    )}
+                </div>
+
+                {/* WEBHOOK / SLACK */}
+                <div className="bg-white rounded-2xl shadow-lg p-6 mb-4">
+                    <h3 className="font-bold text-gray-800 mb-1">💬 Notifications Slack / Webhook</h3>
+                    <p className="text-xs text-gray-500 mb-3">Recois un rappel Slack chaque jour. Fonctionne meme app fermee (via Make.com ou webhook Slack).</p>
+
+                    <input type="url" value={webhookUrl} onChange={e=>setWebhookUrl(e.target.value)}
+                        placeholder="https://hook.eu2.make.com/xxx ou https://hooks.slack.com/xxx"
+                        className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-purple-500 focus:outline-none mb-3 text-sm" />
+
+                    <button onClick={async()=>{const u=webhookUrl.trim();if(u){localStorage.setItem('webhook_url',u);try{const c=await caches.open('webhook-config');await c.put('/webhook-url',new Response(u));}catch(e){}showNotif('Webhook sauvegarde !');}}}
+                        className="w-full bg-purple-500 text-white py-3 rounded-xl font-semibold mb-2">💾 Sauvegarder le webhook</button>
+
+                    {webhookUrl && (
+                        <button onClick={testWebhook}
+                            className={`w-full py-2 rounded-xl font-semibold text-sm mb-2 ${webhookTest==='ok'?'bg-emerald-100 text-emerald-700':webhookTest==='error'?'bg-red-100 text-red-700':'bg-gray-100 text-gray-700'}`}>
+                            {webhookTest==='loading'?'Envoi...':webhookTest==='ok'?'✅ Envoye !':webhookTest==='error'?'❌ Erreur, verifie l\'URL':'🧪 Tester le webhook'}
+                        </button>
+                    )}
+
+                    {webhookUrl && <button onClick={async()=>{if(confirm('Supprimer ?')){localStorage.removeItem('webhook_url');try{const c=await caches.open('webhook-config');await c.delete('/webhook-url');}catch(e){}setWebhookUrl('');showNotif('Supprime');}}} className="w-full bg-red-100 text-red-600 py-2 rounded-xl font-semibold text-sm">Supprimer</button>}
+
+                    <div className="mt-3 p-3 bg-purple-50 rounded-xl text-xs text-gray-600 space-y-2">
+                        <p className="font-bold text-purple-800">Comment configurer :</p>
+                        <p><strong>Option 1 — Make.com (recommande) :</strong> Cree un scenario avec un Webhook trigger. Connecte un module Slack "Send a Message". Colle l'URL du webhook ici. Pour un rappel quotidien automatique, ajoute un Schedule trigger a 8h qui appelle aussi le webhook.</p>
+                        <p><strong>Option 2 — Slack direct :</strong> Cree une app Slack → Incoming Webhooks → copie l'URL ici. Le rappel sera envoye quand l'app s'ouvre ou via Periodic Sync.</p>
+                    </div>
+                </div>
+
+                {/* API KEY */}
+                <div className="bg-white rounded-2xl shadow-lg p-6 mb-4">
+                    <h3 className="font-bold text-gray-800 mb-3">🔑 Cle API Gemini</h3>
+                    <div className="relative mb-3">
+                        <input type={sk?"text":"password"} value={ak} onChange={e=>setAk(e.target.value)} placeholder="AIza..." className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-emerald-500 focus:outline-none pr-12" />
+                        <button onClick={()=>setSk(!sk)} className="absolute right-3 top-3 text-gray-500">{sk?'👁️':'👁️‍🗨️'}</button>
+                    </div>
+                    <button onClick={()=>{const t=ak.trim();if(t){localStorage.setItem('gemini_api_key',t);showNotif('Sauvegardee !');}}} className="w-full bg-emerald-500 text-white py-3 rounded-xl font-semibold mb-2">💾 Sauvegarder</button>
+                    {ak&&<button onClick={()=>{if(confirm('Supprimer ?')){localStorage.removeItem('gemini_api_key');setAk('');showNotif('Supprimee');}}} className="w-full bg-red-500 text-white py-2 rounded-xl font-semibold">🗑️ Supprimer</button>}
+                    <div className="mt-3 p-3 bg-blue-50 rounded-xl text-sm"><a href="https://aistudio.google.com/app/apikey" target="_blank" className="text-blue-600 underline">Obtenir une cle →</a></div>
+                </div>
+
+                <div className="bg-white rounded-2xl shadow-lg p-6 mb-4">
+                    <h3 className="font-bold text-gray-800 mb-2">{season.icon} Saison : {season.name}</h3>
+                    <p className="text-sm text-gray-600">{season.desc}</p>
+                </div>
+                <div className="bg-white rounded-2xl shadow-lg p-6"><p className="text-sm text-gray-600">🌱 Main Verte v1.7 · Gemini 2.5 Flash · {plants.length} plante{plants.length!==1?'s':''}</p></div>
+            </div>
+        );
+    };
+
+    // ===================== RENDER =====================
+    return (
+        <div className="max-w-2xl mx-auto p-4 pb-24">
+            <input ref={fileRef} type="file" accept="image/*" capture="environment" onChange={handleFile} className="hidden" />
+            {notif&&<div className={`fixed top-4 left-4 right-4 z-50 p-4 rounded-xl shadow-lg fade-in text-center font-semibold ${notif.type==='error'?'bg-red-500':'bg-emerald-500'} text-white`}>{notif.message}</div>}
+            {loading&&<div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50"><div className="bg-white rounded-2xl p-8 text-center mx-4"><div className="text-6xl mb-4 animate-bounce">{loadMsg.includes('Diagnostic')?'🩺':'🌱'}</div><div className="text-lg font-bold text-gray-800">{loadMsg}</div><div className="text-sm text-gray-500 mt-2">Gemini analyse...</div></div></div>}
+            <div className="text-center mb-6 mt-4"><h1 className="text-3xl font-bold text-emerald-800">🌿 Main Verte</h1><p className="text-emerald-600 text-sm">Prends soin de tes plantes</p></div>
+            {view==='list'&&<ListView />}
+            {view==='detail'&&<DetailView />}
+            {view==='calendar'&&<CalendarView />}
+            {view==='settings'&&<SettingsView />}
+            {view==='doctor-result'&&<DoctorResultView />}
+            {view==='reidentify'&&<ReIdentifyView />}
+            {view==='chat'&&(
+                <div className="fade-in flex flex-col" style={{height:'calc(100vh - 240px)'}}>
+                    <div className="bg-white/80 backdrop-blur-sm rounded-2xl shadow-lg p-4 mb-4">
+                        <h2 className="text-2xl font-bold text-emerald-800">💬 Assistant jardin</h2>
+                        <p className="text-emerald-600 text-sm">Pose tes questions sur tes plantes</p>
+                    </div>
+                    <div className="flex-1 overflow-y-auto space-y-3 mb-4 px-1">
+                        {chatMessages.length===0 && (
+                            <div className="text-center py-8">
+                                <div className="text-5xl mb-4">🌿</div>
+                                <p className="text-gray-500 mb-4 text-sm">Pose une question sur tes plantes !</p>
+                                <div className="space-y-2">
+                                    {chatQuickQ.map((q,i) => (
+                                        <button key={i} onClick={()=>setChatInput(q)} className="w-full bg-white rounded-xl p-3 text-sm text-left text-gray-700 shadow-sm border border-gray-100">💬 {q}</button>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+                        {chatMessages.map((m,i) => (
+                            <div key={i} className={`flex ${m.role==='user'?'justify-end':'justify-start'}`}>
+                                <div className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm ${m.role==='user'?'bg-emerald-500 text-white rounded-br-sm':'bg-white shadow-md text-gray-800 rounded-bl-sm'}`}>
+                                    <div style={{whiteSpace:'pre-wrap'}}>{m.text}</div>
+                                </div>
+                            </div>
+                        ))}
+                        {chatLoading && (
+                            <div className="flex justify-start">
+                                <div className="bg-white shadow-md rounded-2xl rounded-bl-sm px-4 py-3">
+                                    <div className="flex gap-1"><span className="animate-bounce">.</span><span className="animate-bounce" style={{animationDelay:'0.1s'}}>.</span><span className="animate-bounce" style={{animationDelay:'0.2s'}}>.</span></div>
+                                </div>
+                            </div>
+                        )}
+                        <div ref={chatEndRef} />
+                    </div>
+                    <div className="flex gap-2 mt-auto">
+                        <input value={chatInput} onChange={e=>setChatInput(e.target.value)}
+                            onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat();}}}
+                            placeholder="Pose ta question..." className="flex-1 px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-emerald-500 focus:outline-none text-sm" />
+                        <button onClick={sendChat} disabled={chatLoading||!chatInput.trim()}
+                            className={`px-4 py-3 rounded-xl font-semibold ${chatInput.trim()&&!chatLoading?'bg-emerald-500 text-white':'bg-gray-200 text-gray-400'}`}>
+                            ➤
+                        </button>
+                    </div>
+                </div>
+            )}
+            <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-lg">
+                <div className="max-w-2xl mx-auto grid grid-cols-5 gap-1 p-3">
+                    <button onClick={()=>{setView('list');setSelPlant(null);}} className={`flex flex-col items-center gap-1 py-2 rounded-lg ${['list','detail','doctor-result','reidentify'].includes(view)?'bg-emerald-100 text-emerald-700':'text-gray-600'}`}><span className="text-xl">🏠</span><span className="text-xs font-semibold">Plantes</span></button>
+                    <button onClick={()=>setView('calendar')} className={`flex flex-col items-center gap-1 py-2 rounded-lg ${view==='calendar'?'bg-emerald-100 text-emerald-700':'text-gray-600'}`}><span className="text-xl">📅</span><span className="text-xs font-semibold">Planning</span></button>
+                    <button onClick={()=>openInput('identify')} className="flex flex-col items-center gap-1 bg-emerald-500 text-white py-2 rounded-lg shadow-lg -mt-4"><span className="text-2xl">📸</span><span className="text-xs font-semibold">Ajouter</span></button>
+                    <button onClick={()=>setView('chat')} className={`flex flex-col items-center gap-1 py-2 rounded-lg ${view==='chat'?'bg-emerald-100 text-emerald-700':'text-gray-600'}`}><span className="text-xl">💬</span><span className="text-xs font-semibold">Chat</span></button>
+                    <button onClick={()=>setView('settings')} className={`flex flex-col items-center gap-1 py-2 rounded-lg ${view==='settings'?'bg-emerald-100 text-emerald-700':'text-gray-600'}`}><span className="text-xl">⚙️</span><span className="text-xs font-semibold">Reglages</span></button>
+                </div>
+            </div>
+        </div>
+    );
+}
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+<script>
+// Service Worker + Periodic Background Sync registration
+if ('serviceWorker' in navigator) {
+    window.addEventListener('load', async () => {
+        try {
+            const reg = await navigator.serviceWorker.register('/sw.js');
+            console.log('SW registered:', reg.scope);
+
+            // Register Periodic Background Sync (~daily watering check)
+            if ('periodicSync' in reg) {
+                const status = await navigator.permissions.query({ name: 'periodic-background-sync' });
+                if (status.state === 'granted') {
+                    try {
+                        await reg.periodicSync.register('check-watering', {
+                            minInterval: 12 * 60 * 60 * 1000 // 12 hours minimum
+                        });
+                        console.log('Periodic sync registered');
+                    } catch (e) {
+                        console.log('Periodic sync failed:', e);
+                    }
+                }
+            }
+
+            // Fallback: also check on app open via regular sync
+            if ('sync' in reg) {
+                try { await reg.sync.register('check-watering-sync'); } catch (e) {}
+            }
+        } catch (e) {
+            console.log('SW error:', e);
+        }
+    });
+}
+
+// Fallback notification on app open (works always)
+// Also sends webhook if configured
+window.addEventListener('load', () => {
+    // Sync webhook URL from localStorage to Cache API (for SW access)
+    (async () => {
+        try {
+            const url = localStorage.getItem('webhook_url');
+            if (url) {
+                const c = await caches.open('webhook-config');
+                await c.put('/webhook-url', new Response(url));
+            }
+        } catch(e) {}
+    })();
+
+    setTimeout(async () => {
+        try {
+            // Read from IndexedDB
+            const req = indexedDB.open('PlantMonitorDB', 1);
+            req.onsuccess = async () => {
+                const db = req.result;
+                if (!db.objectStoreNames.contains('plants')) return;
+                const tx = db.transaction('plants', 'readonly');
+                const store = tx.objectStore('plants');
+                const getAll = store.getAll();
+                getAll.onsuccess = async () => {
+                    const plants = getAll.result || [];
+                    const today = new Date();
+                    today.setHours(0, 0, 0, 0);
+                    const need = plants.filter(p => {
+                        if (p.prescription && new Date(p.prescription.endDate) > new Date() && p.prescription.noWatering) return false;
+                        return new Date(p.nextWatering + 'T00:00:00') <= today;
+                    });
+                    if (need.length === 0) return;
+
+                    const title = need.length === 1
+                        ? '💧 ' + need[0].name + ' a soif !'
+                        : '💧 ' + need.length + ' plantes a arroser';
+                    const body = need.map(p => p.name).join(', ');
+
+                    // Push notification (if permission granted)
+                    if ('Notification' in window && Notification.permission === 'granted') {
+                        try { new Notification(title, { body, icon: '/icon-192.png', tag: 'open-reminder' }); } catch(e) {}
+                    }
+
+                    // Webhook (on every app open if plants need watering)
+                    const webhookUrl = localStorage.getItem('webhook_url');
+                    if (webhookUrl) {
+                        try {
+                            await fetch(webhookUrl, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    type: 'reminder',
+                                    app: 'Main Verte',
+                                    date: new Date().toISOString(),
+                                    total_plants: plants.length,
+                                    plants_to_water: need.length,
+                                    message: title + ' — ' + body,
+                                    plants: need.map(p => ({ name: p.name, next_watering: p.nextWatering, water_amount: p.waterAmount || '' }))
+                                }),
+                                mode: 'no-cors'
+                            });
+                        } catch(e) {}
+                    }
+                };
+            };
+        } catch (e) {}
+    }, 2000);
+});
+</script>
+</body>
+</html>
