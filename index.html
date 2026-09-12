@@ -248,25 +248,23 @@ function extractAnswer(data) {
     return null;
 }
 
+const GEMINI_ENDPOINT = '/.netlify/functions/gemini';
+
 async function callGemini(base64, mimeType, prompt) {
-    const apiKey = localStorage.getItem('gemini_api_key');
-    if (!apiKey) throw new Error('Configure ta cle API dans Reglages.');
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
     const body = {
         contents:[{parts:[{text:prompt},{inline_data:{mime_type:mimeType,data:base64}}]}],
         generationConfig:{temperature:0.2,maxOutputTokens:1200,responseMimeType:'application/json',thinkingConfig:{thinkingBudget:0}}
     };
-    let resp = await fetch(url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    let resp = await fetch(GEMINI_ENDPOINT, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if (resp.status===400) {
         const eb = await resp.json().catch(()=>({}));
         if (JSON.stringify(eb).includes('thinking')) {
             delete body.generationConfig.thinkingConfig;
-            resp = await fetch(url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+            resp = await fetch(GEMINI_ENDPOINT, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
         } else throw new Error(eb.error?.message||'Erreur API');
     }
     if (!resp.ok) {
         const err = await resp.json().catch(()=>({}));
-        if (resp.status===401||resp.status===403) throw new Error('Cle API invalide.');
         throw new Error(err.error?.message||`Erreur ${resp.status}`);
     }
     const data = await resp.json();
@@ -576,17 +574,14 @@ function App() {
 
     // ===================== CHAT =====================
     async function callGeminiText(systemPrompt, userMessage) {
-        const apiKey = localStorage.getItem('gemini_api_key');
-        if (!apiKey) throw new Error('Configure ta cle API dans Reglages.');
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
         const body = {
             contents:[{parts:[{text: systemPrompt + '\n\nQuestion: ' + userMessage}]}],
             generationConfig:{temperature:0.7,maxOutputTokens:800,thinkingConfig:{thinkingBudget:0}}
         };
-        let resp = await fetch(url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+        let resp = await fetch(GEMINI_ENDPOINT, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
         if (resp.status===400) {
             delete body.generationConfig.thinkingConfig;
-            resp = await fetch(url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+            resp = await fetch(GEMINI_ENDPOINT, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
         }
         if (!resp.ok) throw new Error('Erreur API');
         const data = await resp.json();
@@ -627,8 +622,8 @@ function App() {
         </div>
     );
 
-    // Show landing on first visit (no API key + no plants)
-    const isFirstVisit = !localStorage.getItem('gemini_api_key') && plants.length === 0 && !localStorage.getItem('onboarding_done');
+    // Show landing on first visit
+    const isFirstVisit = plants.length === 0 && !localStorage.getItem('onboarding_done');
 
     if (isFirstVisit && view === 'list') return (
         <div className="min-h-screen relative overflow-hidden">
@@ -705,28 +700,10 @@ function App() {
                 <div className="mb-10">
                     <h2 className="text-center font-bold text-emerald-800 text-lg mb-6">Comment demarrer ?</h2>
 
-                    {/* Step 1: API Key */}
+                    {/* Step 1: Scan */}
                     <div className="bg-white/80 backdrop-blur-sm rounded-2xl p-5 shadow-lg mb-4">
                         <div className="flex items-center gap-3 mb-3">
                             <div className="w-8 h-8 bg-emerald-500 text-white rounded-full flex items-center justify-center font-bold flex-shrink-0">1</div>
-                            <h3 className="font-bold text-gray-800">Obtenir ta cle API Gemini (gratuit)</h3>
-                        </div>
-                        <div className="ml-11 space-y-2 text-sm text-gray-600">
-                            <p>1. Va sur <a href="https://aistudio.google.com/app/apikey" target="_blank" className="text-emerald-600 underline font-semibold">Google AI Studio</a></p>
-                            <p>2. Connecte-toi avec ton compte Google</p>
-                            <p>3. Clique sur "Create API Key"</p>
-                            <p>4. Copie la cle qui commence par "AIza..."</p>
-                            <p>5. Colle-la dans les reglages de l'app</p>
-                            <div className="bg-emerald-50 rounded-lg p-3 mt-2">
-                                <p className="text-xs text-emerald-700">💡 L'offre gratuite permet ~1500 requetes/jour, largement suffisant pour un usage personnel ou d'equipe.</p>
-                            </div>
-                        </div>
-                    </div>
-
-                    {/* Step 2: Scan */}
-                    <div className="bg-white/80 backdrop-blur-sm rounded-2xl p-5 shadow-lg mb-4">
-                        <div className="flex items-center gap-3 mb-3">
-                            <div className="w-8 h-8 bg-emerald-500 text-white rounded-full flex items-center justify-center font-bold flex-shrink-0">2</div>
                             <h3 className="font-bold text-gray-800">Photographie tes plantes</h3>
                         </div>
                         <div className="ml-11 text-sm text-gray-600">
@@ -734,10 +711,10 @@ function App() {
                         </div>
                     </div>
 
-                    {/* Step 3: Slack (optional) */}
+                    {/* Step 2: Slack (optional) */}
                     <div className="bg-white/80 backdrop-blur-sm rounded-2xl p-5 shadow-lg mb-4">
                         <div className="flex items-center gap-3 mb-3">
-                            <div className="w-8 h-8 bg-purple-500 text-white rounded-full flex items-center justify-center font-bold flex-shrink-0">3</div>
+                            <div className="w-8 h-8 bg-purple-500 text-white rounded-full flex items-center justify-center font-bold flex-shrink-0">2</div>
                             <h3 className="font-bold text-gray-800">Connecter Slack <span className="text-xs font-normal text-gray-400">(optionnel)</span></h3>
                         </div>
                         <div className="ml-11 space-y-2 text-sm text-gray-600">
@@ -767,7 +744,6 @@ function App() {
                         className="w-full bg-emerald-500 text-white py-4 rounded-2xl font-bold text-lg shadow-xl shadow-emerald-500/30 active:scale-[0.98] transition-transform">
                         🌱 Commencer
                     </button>
-                    <p className="text-xs text-gray-400">Necessite une cle API Google Gemini gratuite</p>
                 </div>
 
                 {/* Footer */}
@@ -1136,8 +1112,6 @@ function App() {
 
     // ===================== SETTINGS VIEW =====================
     const SettingsView = () => {
-        const [ak,setAk]=useState(localStorage.getItem('gemini_api_key')||'');
-        const [sk,setSk]=useState(false);
         const [np,setNp]=useState('Notification' in window?Notification.permission:'unsupported');
         const [diag,setDiag]=useState(null);
         const [webhookUrl,setWebhookUrl]=useState(localStorage.getItem('webhook_url')||'');
@@ -1338,18 +1312,6 @@ function App() {
                         <p><strong>Option 1 — Make.com (recommande) :</strong> Cree un scenario avec un Webhook trigger. Connecte un module Slack "Send a Message". Colle l'URL du webhook ici. Pour un rappel quotidien automatique, ajoute un Schedule trigger a 8h qui appelle aussi le webhook.</p>
                         <p><strong>Option 2 — Slack direct :</strong> Cree une app Slack → Incoming Webhooks → copie l'URL ici. Le rappel sera envoye quand l'app s'ouvre ou via Periodic Sync.</p>
                     </div>
-                </div>
-
-                {/* API KEY */}
-                <div className="bg-white rounded-2xl shadow-lg p-6 mb-4">
-                    <h3 className="font-bold text-gray-800 mb-3">🔑 Cle API Gemini</h3>
-                    <div className="relative mb-3">
-                        <input type={sk?"text":"password"} value={ak} onChange={e=>setAk(e.target.value)} placeholder="AIza..." className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-emerald-500 focus:outline-none pr-12" />
-                        <button onClick={()=>setSk(!sk)} className="absolute right-3 top-3 text-gray-500">{sk?'👁️':'👁️‍🗨️'}</button>
-                    </div>
-                    <button onClick={()=>{const t=ak.trim();if(t){localStorage.setItem('gemini_api_key',t);showNotif('Sauvegardee !');}}} className="w-full bg-emerald-500 text-white py-3 rounded-xl font-semibold mb-2">💾 Sauvegarder</button>
-                    {ak&&<button onClick={()=>{if(confirm('Supprimer ?')){localStorage.removeItem('gemini_api_key');setAk('');showNotif('Supprimee');}}} className="w-full bg-red-500 text-white py-2 rounded-xl font-semibold">🗑️ Supprimer</button>}
-                    <div className="mt-3 p-3 bg-blue-50 rounded-xl text-sm"><a href="https://aistudio.google.com/app/apikey" target="_blank" className="text-blue-600 underline">Obtenir une cle →</a></div>
                 </div>
 
                 <div className="bg-white rounded-2xl shadow-lg p-6 mb-4">
