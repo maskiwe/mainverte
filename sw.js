@@ -33,7 +33,9 @@ self.addEventListener('fetch', (event) => {
     const url = new URL(event.request.url);
     if (url.hostname.includes('googleapis.com') ||
         url.hostname.includes('cdn.tailwindcss.com') ||
-        url.hostname.includes('unpkg.com')) {
+        url.hostname.includes('unpkg.com') ||
+        url.hostname.endsWith('supabase.co') ||
+        url.pathname.startsWith('/.netlify/functions/')) {
         return;
     }
     event.respondWith(

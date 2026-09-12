@@ -250,17 +250,23 @@ function extractAnswer(data) {
 
 const GEMINI_ENDPOINT = '/.netlify/functions/gemini';
 
+async function geminiHeaders() {
+    const { data } = await supabaseClient.auth.getSession();
+    return { 'Content-Type': 'application/json', 'Authorization': `Bearer ${data.session?.access_token || ''}` };
+}
+
 async function callGemini(base64, mimeType, prompt) {
     const body = {
         contents:[{parts:[{text:prompt},{inline_data:{mime_type:mimeType,data:base64}}]}],
         generationConfig:{temperature:0.2,maxOutputTokens:1200,responseMimeType:'application/json',thinkingConfig:{thinkingBudget:0}}
     };
-    let resp = await fetch(GEMINI_ENDPOINT, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const headers = await geminiHeaders();
+    let resp = await fetch(GEMINI_ENDPOINT, {method:'POST',headers,body:JSON.stringify(body)});
     if (resp.status===400) {
         const eb = await resp.json().catch(()=>({}));
         if (JSON.stringify(eb).includes('thinking')) {
             delete body.generationConfig.thinkingConfig;
-            resp = await fetch(GEMINI_ENDPOINT, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+            resp = await fetch(GEMINI_ENDPOINT, {method:'POST',headers,body:JSON.stringify(body)});
         } else throw new Error(eb.error?.message||'Erreur API');
     }
     if (!resp.ok) {
@@ -578,10 +584,11 @@ function App() {
             contents:[{parts:[{text: systemPrompt + '\n\nQuestion: ' + userMessage}]}],
             generationConfig:{temperature:0.7,maxOutputTokens:800,thinkingConfig:{thinkingBudget:0}}
         };
-        let resp = await fetch(GEMINI_ENDPOINT, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+        const headers = await geminiHeaders();
+        let resp = await fetch(GEMINI_ENDPOINT, {method:'POST',headers,body:JSON.stringify(body)});
         if (resp.status===400) {
             delete body.generationConfig.thinkingConfig;
-            resp = await fetch(GEMINI_ENDPOINT, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+            resp = await fetch(GEMINI_ENDPOINT, {method:'POST',headers,body:JSON.stringify(body)});
         }
         if (!resp.ok) throw new Error('Erreur API');
         const data = await resp.json();
