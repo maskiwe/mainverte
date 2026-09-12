@@ -344,10 +344,21 @@ Regles pour prescription :
 
 // ===================== LOGIN (magic link) =====================
 function LoginView() {
+    const [mode, setMode] = useState('password'); // 'password' | 'magic'
     const [email, setEmail] = useState('');
+    const [password, setPassword] = useState('');
     const [sent, setSent] = useState(false);
     const [sending, setSending] = useState(false);
     const [err, setErr] = useState('');
+
+    async function signIn() {
+        const e = email.trim();
+        if (!e || !password) return;
+        setSending(true); setErr('');
+        const { error } = await supabaseClient.auth.signInWithPassword({ email: e, password });
+        setSending(false);
+        if (error) setErr(error.message);
+    }
 
     async function sendLink() {
         const e = email.trim();
@@ -367,19 +378,42 @@ function LoginView() {
             <div className="max-w-sm w-full bg-white/80 backdrop-blur-sm rounded-2xl shadow-lg p-6 text-center">
                 <div className="text-5xl mb-4">🌱</div>
                 <h1 className="text-2xl font-bold text-emerald-800 mb-2">Main Verte</h1>
-                {sent ? (
-                    <p className="text-sm text-gray-600">Verifie ta boite mail ({email}) et clique sur le lien pour te connecter.</p>
-                ) : (
+
+                {mode === 'password' ? (
                     <>
                         <p className="text-sm text-gray-600 mb-4">Connecte-toi pour retrouver tes plantes sur tous tes appareils.</p>
+                        <input type="email" value={email} onChange={e=>setEmail(e.target.value)}
+                            placeholder="ton@email.com"
+                            className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-emerald-500 focus:outline-none mb-3 text-sm" />
+                        <input type="password" value={password} onChange={e=>setPassword(e.target.value)}
+                            onKeyDown={e=>{if(e.key==='Enter') signIn();}}
+                            placeholder="Mot de passe"
+                            className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-emerald-500 focus:outline-none mb-3 text-sm" />
+                        {err && <p className="text-xs text-red-500 mb-2">{err}</p>}
+                        <button onClick={signIn} disabled={sending || !email.trim() || !password}
+                            className="w-full bg-emerald-500 text-white py-3 rounded-xl font-semibold disabled:opacity-50 mb-3">
+                            {sending ? 'Connexion...' : 'Se connecter'}
+                        </button>
+                        <button onClick={()=>{setMode('magic');setErr('');setSent(false);}} className="text-xs text-gray-500 underline">
+                            Pas encore de mot de passe ? Recevoir un lien de connexion
+                        </button>
+                    </>
+                ) : sent ? (
+                    <p className="text-sm text-gray-600">Verifie ta boite mail ({email}) et clique sur le lien pour te connecter. Tu pourras definir un mot de passe dans Reglages ensuite.</p>
+                ) : (
+                    <>
+                        <p className="text-sm text-gray-600 mb-4">Recois un lien de connexion par email, puis definis un mot de passe dans Reglages pour te connecter plus vite la prochaine fois.</p>
                         <input type="email" value={email} onChange={e=>setEmail(e.target.value)}
                             onKeyDown={e=>{if(e.key==='Enter') sendLink();}}
                             placeholder="ton@email.com"
                             className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-emerald-500 focus:outline-none mb-3 text-sm" />
                         {err && <p className="text-xs text-red-500 mb-2">{err}</p>}
                         <button onClick={sendLink} disabled={sending || !email.trim()}
-                            className="w-full bg-emerald-500 text-white py-3 rounded-xl font-semibold disabled:opacity-50">
+                            className="w-full bg-emerald-500 text-white py-3 rounded-xl font-semibold disabled:opacity-50 mb-3">
                             {sending ? 'Envoi...' : 'Recevoir le lien de connexion'}
+                        </button>
+                        <button onClick={()=>{setMode('password');setErr('');}} className="text-xs text-gray-500 underline">
+                            ← Retour a la connexion par mot de passe
                         </button>
                     </>
                 )}
@@ -1123,7 +1157,20 @@ function App() {
         const [diag,setDiag]=useState(null);
         const [webhookUrl,setWebhookUrl]=useState(localStorage.getItem('webhook_url')||'');
         const [webhookTest,setWebhookTest]=useState(null);
+        const [newPw,setNewPw]=useState('');
+        const [pwSaving,setPwSaving]=useState(false);
         const withRx=plants.filter(p=>getActivePrescription(p));
+
+        async function savePassword() {
+            const pw = newPw.trim();
+            if (pw.length < 6) { showNotif('6 caracteres minimum','error'); return; }
+            setPwSaving(true);
+            const { error } = await supabaseClient.auth.updateUser({ password: pw });
+            setPwSaving(false);
+            if (error) { showNotif(error.message,'error'); return; }
+            setNewPw('');
+            showNotif('Mot de passe enregistre !');
+        }
 
         // Full notification diagnostic
         async function runDiagnostic() {
@@ -1235,6 +1282,20 @@ function App() {
                         {session?.user?.email && <p className="text-xs text-gray-500 mt-1">Connecte : {session.user.email}</p>}
                     </div>
                     <button onClick={()=>supabaseClient.auth.signOut()} className="text-xs bg-gray-100 text-gray-600 px-3 py-2 rounded-lg font-semibold">Deconnexion</button>
+                </div>
+
+                {/* MOT DE PASSE */}
+                <div className="bg-white rounded-2xl shadow-lg p-6 mb-4">
+                    <h3 className="font-bold text-gray-800 mb-1">🔒 Mot de passe</h3>
+                    <p className="text-xs text-gray-500 mb-3">Pour te connecter plus vite sur tes autres navigateurs, sans passer par un email a chaque fois.</p>
+                    <input type="password" value={newPw} onChange={e=>setNewPw(e.target.value)}
+                        onKeyDown={e=>{if(e.key==='Enter') savePassword();}}
+                        placeholder="Nouveau mot de passe (6 caracteres min.)"
+                        className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-emerald-500 focus:outline-none mb-3 text-sm" />
+                    <button onClick={savePassword} disabled={pwSaving || newPw.trim().length<6}
+                        className="w-full bg-emerald-500 text-white py-3 rounded-xl font-semibold disabled:opacity-50">
+                        {pwSaving ? 'Enregistrement...' : '💾 Definir le mot de passe'}
+                    </button>
                 </div>
 
                 {withRx.length>0&&(
