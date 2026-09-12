@@ -16,6 +16,7 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
     <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
     <style>
         body { overscroll-behavior: none; -webkit-font-smoothing: antialiased; }
@@ -139,8 +140,60 @@ function fileToBase64(file) {
     });
 }
 
+// =====================================================
+// Supabase - source de verite pour les plantes
+// IndexedDB reste un cache de lecture (hors-ligne, notifs)
+// =====================================================
+const supabaseClient = supabase.createClient(
+    'https://ejccsolcvcbhhwhqnfai.supabase.co',
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVqY2Nzb2xjdmNiaGh3aHFuZmFpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkyMTg1MjYsImV4cCI6MjEwNDc5NDUyNn0.vzd8WzVceF8Z61iC1FT8aq8PkSrAWWRJmOmYb2QjD5s'
+);
+window.supabaseClient = supabaseClient;
+
+async function sbLoadPlants(userId) {
+    const { data, error } = await supabaseClient.from('plants').select('id, data').eq('user_id', userId);
+    if (error) throw error;
+    return (data || []).map(r => r.data);
+}
+
+async function sbSavePlants(plants, userId) {
+    const ids = plants.map(p => p.id);
+    if (plants.length > 0) {
+        const rows = plants.map(p => ({ id: p.id, user_id: userId, data: p, updated_at: new Date().toISOString() }));
+        const { error } = await supabaseClient.from('plants').upsert(rows);
+        if (error) throw error;
+    }
+    let delQuery = supabaseClient.from('plants').delete().eq('user_id', userId);
+    if (ids.length > 0) delQuery = delQuery.not('id', 'in', `(${ids.join(',')})`);
+    const { error: delError } = await delQuery;
+    if (delError) throw delError;
+    return true;
+}
+
+async function loadPlants(userId) {
+    try {
+        const remote = await sbLoadPlants(userId);
+        dbSavePlants(remote); // rafraichit le cache local, sans attendre
+        return remote;
+    } catch (e) {
+        console.error('Supabase load failed, fallback IndexedDB:', e);
+        return dbLoadPlants();
+    }
+}
+
+async function savePlants(plants, userId) {
+    dbSavePlants(plants); // cache local toujours a jour immediatement
+    try {
+        await sbSavePlants(plants, userId);
+        return true;
+    } catch (e) {
+        console.error('Supabase save failed:', e);
+        return false;
+    }
+}
+
 // Expose to React
-window.PlantDB = { load: dbLoadPlants, save: dbSavePlants };
+window.PlantDB = { load: loadPlants, save: savePlants };
 window.PhotoUtils = { compress: compressPhoto, toBase64: fileToBase64 };
 </script>
 
@@ -285,8 +338,55 @@ Regles pour prescription :
 - severity : leger, modere ou grave
 - UNIQUEMENT le JSON`;
 
+// ===================== LOGIN (magic link) =====================
+function LoginView() {
+    const [email, setEmail] = useState('');
+    const [sent, setSent] = useState(false);
+    const [sending, setSending] = useState(false);
+    const [err, setErr] = useState('');
+
+    async function sendLink() {
+        const e = email.trim();
+        if (!e) return;
+        setSending(true); setErr('');
+        const { error } = await supabaseClient.auth.signInWithOtp({
+            email: e,
+            options: { emailRedirectTo: window.location.origin }
+        });
+        setSending(false);
+        if (error) { setErr(error.message); return; }
+        setSent(true);
+    }
+
+    return (
+        <div className="flex items-center justify-center min-h-screen px-6">
+            <div className="max-w-sm w-full bg-white/80 backdrop-blur-sm rounded-2xl shadow-lg p-6 text-center">
+                <div className="text-5xl mb-4">🌱</div>
+                <h1 className="text-2xl font-bold text-emerald-800 mb-2">Main Verte</h1>
+                {sent ? (
+                    <p className="text-sm text-gray-600">Verifie ta boite mail ({email}) et clique sur le lien pour te connecter.</p>
+                ) : (
+                    <>
+                        <p className="text-sm text-gray-600 mb-4">Connecte-toi pour retrouver tes plantes sur tous tes appareils.</p>
+                        <input type="email" value={email} onChange={e=>setEmail(e.target.value)}
+                            onKeyDown={e=>{if(e.key==='Enter') sendLink();}}
+                            placeholder="ton@email.com"
+                            className="w-full px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-emerald-500 focus:outline-none mb-3 text-sm" />
+                        {err && <p className="text-xs text-red-500 mb-2">{err}</p>}
+                        <button onClick={sendLink} disabled={sending || !email.trim()}
+                            className="w-full bg-emerald-500 text-white py-3 rounded-xl font-semibold disabled:opacity-50">
+                            {sending ? 'Envoi...' : 'Recevoir le lien de connexion'}
+                        </button>
+                    </>
+                )}
+            </div>
+        </div>
+    );
+}
+
 // ===================== MAIN APP =====================
 function App() {
+    const [session, setSession] = useState(undefined);
     const [plants, setPlants] = useState([]);
     const [dbReady, setDbReady] = useState(false);
     const [view, setView] = useState('list');
@@ -306,24 +406,35 @@ function App() {
     const chatEndRef = useRef(null);
     const season = getSeason();
 
-    // Load plants from IndexedDB on mount
+    // Auth: recupere la session et ecoute les changements (connexion/deconnexion)
     useEffect(() => {
-        window.PlantDB.load().then(data => {
+        supabaseClient.auth.getSession().then(({data}) => setSession(data.session));
+        const { data: listener } = supabaseClient.auth.onAuthStateChange((_event, s) => {
+            setSession(s);
+            if (!s) { setPlants([]); setDbReady(false); }
+        });
+        return () => listener.subscription.unsubscribe();
+    }, []);
+
+    // Load plants (Supabase, fallback IndexedDB) une fois connecte
+    useEffect(() => {
+        if (!session) return;
+        window.PlantDB.load(session.user.id).then(data => {
             setPlants(data);
             setDbReady(true);
         }).catch(() => setDbReady(true));
-    }, []);
+    }, [session]);
 
-    // Debounced save to IndexedDB when plants change
+    // Debounced save (Supabase + cache IndexedDB) when plants change
     useEffect(() => {
-        if (!dbReady) return;
+        if (!dbReady || !session) return;
         if (saveTimer.current) clearTimeout(saveTimer.current);
         saveTimer.current = setTimeout(() => {
-            window.PlantDB.save(plants).then(ok => {
+            window.PlantDB.save(plants, session.user.id).then(ok => {
                 if (!ok) console.error('Save failed');
             });
         }, 300);
-    }, [plants, dbReady]);
+    }, [plants, dbReady, session]);
 
     // Clean expired prescriptions
     useEffect(() => {
@@ -498,6 +609,16 @@ function App() {
     }
 
     useEffect(()=>{ chatEndRef.current?.scrollIntoView({behavior:'smooth'}); }, [chatMessages]);
+
+    // Verification de la session en cours
+    if (session === undefined) return (
+        <div className="flex items-center justify-center min-h-screen">
+            <div className="text-center"><div className="text-6xl mb-4 animate-bounce">🌱</div><div className="text-lg text-emerald-700">Chargement...</div></div>
+        </div>
+    );
+
+    // Pas connecte : ecran de connexion par magic link
+    if (!session) return <LoginView />;
 
     // Loading screen while DB loads
     if (!dbReady) return (
@@ -1127,7 +1248,13 @@ function App() {
 
         return (
             <div className="fade-in">
-                <div className="bg-white/80 backdrop-blur-sm rounded-2xl shadow-lg p-6 mb-6"><h2 className="text-2xl font-bold text-emerald-800">Parametres ⚙️</h2></div>
+                <div className="bg-white/80 backdrop-blur-sm rounded-2xl shadow-lg p-6 mb-6 flex items-center justify-between">
+                    <div>
+                        <h2 className="text-2xl font-bold text-emerald-800">Parametres ⚙️</h2>
+                        {session?.user?.email && <p className="text-xs text-gray-500 mt-1">Connecte : {session.user.email}</p>}
+                    </div>
+                    <button onClick={()=>supabaseClient.auth.signOut()} className="text-xs bg-gray-100 text-gray-600 px-3 py-2 rounded-lg font-semibold">Deconnexion</button>
+                </div>
 
                 {withRx.length>0&&(
                     <div className="bg-amber-50 border-2 border-amber-200 rounded-2xl shadow-lg p-4 mb-4">
