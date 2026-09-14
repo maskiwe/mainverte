@@ -258,17 +258,10 @@ async function geminiHeaders() {
 async function callGemini(base64, mimeType, prompt) {
     const body = {
         contents:[{parts:[{text:prompt},{inline_data:{mime_type:mimeType,data:base64}}]}],
-        generationConfig:{temperature:0.2,maxOutputTokens:1200,responseMimeType:'application/json',thinkingConfig:{thinkingBudget:0}}
+        generationConfig:{maxOutputTokens:4000,responseMimeType:'application/json'}
     };
     const headers = await geminiHeaders();
-    let resp = await fetch(GEMINI_ENDPOINT, {method:'POST',headers,body:JSON.stringify(body)});
-    if (resp.status===400) {
-        const eb = await resp.json().catch(()=>({}));
-        if (JSON.stringify(eb).includes('thinking')) {
-            delete body.generationConfig.thinkingConfig;
-            resp = await fetch(GEMINI_ENDPOINT, {method:'POST',headers,body:JSON.stringify(body)});
-        } else throw new Error(eb.error?.message||'Erreur API');
-    }
+    const resp = await fetch(GEMINI_ENDPOINT, {method:'POST',headers,body:JSON.stringify(body)});
     if (!resp.ok) {
         const err = await resp.json().catch(()=>({}));
         throw new Error(err.error?.message||`Erreur ${resp.status}`);
@@ -616,14 +609,10 @@ function App() {
     async function callGeminiText(systemPrompt, userMessage) {
         const body = {
             contents:[{parts:[{text: systemPrompt + '\n\nQuestion: ' + userMessage}]}],
-            generationConfig:{temperature:0.7,maxOutputTokens:800,thinkingConfig:{thinkingBudget:0}}
+            generationConfig:{maxOutputTokens:3000}
         };
         const headers = await geminiHeaders();
-        let resp = await fetch(GEMINI_ENDPOINT, {method:'POST',headers,body:JSON.stringify(body)});
-        if (resp.status===400) {
-            delete body.generationConfig.thinkingConfig;
-            resp = await fetch(GEMINI_ENDPOINT, {method:'POST',headers,body:JSON.stringify(body)});
-        }
+        const resp = await fetch(GEMINI_ENDPOINT, {method:'POST',headers,body:JSON.stringify(body)});
         if (!resp.ok) throw new Error('Erreur API');
         const data = await resp.json();
         return extractAnswer(data) || 'Pas de reponse.';
