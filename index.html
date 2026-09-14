@@ -130,16 +130,6 @@ function compressPhoto(file, maxSize, quality) {
     });
 }
 
-// Also keep raw base64 for API (higher quality for identification)
-function fileToBase64(file) {
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result.split(',')[1]);
-        reader.onerror = () => reject(new Error('Erreur lecture'));
-        reader.readAsDataURL(file);
-    });
-}
-
 // =====================================================
 // Supabase - source de verite pour les plantes
 // IndexedDB reste un cache de lecture (hors-ligne, notifs)
@@ -194,7 +184,7 @@ async function savePlants(plants, userId) {
 
 // Expose to React
 window.PlantDB = { load: loadPlants, save: savePlants };
-window.PhotoUtils = { compress: compressPhoto, toBase64: fileToBase64 };
+window.PhotoUtils = { compress: compressPhoto };
 </script>
 
 <script type="text/babel">
@@ -491,12 +481,12 @@ function App() {
     async function handleIdentify(file) {
         setLoading(true); setLoadMsg('Identification en cours...');
         try {
-            // Full quality for API identification
-            const apiB64 = await window.PhotoUtils.toBase64(file);
-            // Compressed for storage (~80KB instead of ~4MB)
+            // Compressed for the API: Netlify Functions cap requests at 6MB
+            const apiB64 = await window.PhotoUtils.compress(file, 1024, 0.8);
+            // More compressed for storage (~80KB instead of ~4MB)
             const storeB64 = await window.PhotoUtils.compress(file, 800, 0.6);
 
-            const info = await callGemini(apiB64, file.type||'image/jpeg', IDENTIFY_PROMPT);
+            const info = await callGemini(apiB64, 'image/jpeg', IDENTIFY_PROMPT);
             if (!info.name) throw new Error('Plante non reconnue.');
             const base = Math.max(1,Math.round(Number(info.wateringFrequency)||7));
             const af = adjFreq(base);
@@ -522,9 +512,9 @@ function App() {
     async function handleDoctor(file) {
         setLoading(true); setLoadMsg('Diagnostic en cours...');
         try {
-            const apiB64 = await window.PhotoUtils.toBase64(file);
+            const apiB64 = await window.PhotoUtils.compress(file, 1024, 0.8);
             const storeB64 = await window.PhotoUtils.compress(file, 600, 0.5);
-            const r = await callGemini(apiB64, file.type||'image/jpeg', DOCTOR_PROMPT);
+            const r = await callGemini(apiB64, 'image/jpeg', DOCTOR_PROMPT);
             if (!r.diagnosis) throw new Error('Diagnostic impossible.');
             r.photo = storeB64; r.photoType = 'image/jpeg';
             setDoctorResult(r); setView('doctor-result');
