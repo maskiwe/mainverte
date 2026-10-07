@@ -1,3 +1,7 @@
 [build]
   publish = "."
   functions = "netlify/functions"
+
+[build.environment]
+  # La cle publique VAPID est embarquee dans index.html par conception (non secrete)
+  SECRETS_SCAN_OMIT_KEYS = "VAPID_PUBLIC_KEY"
