@@ -7,12 +7,14 @@ const SUPABASE_URL = 'https://ejccsolcvcbhhwhqnfai.supabase.co';
 
 exports.config = { schedule: '0 7 * * *' }; // 07:00 UTC (8h/9h en France)
 
+// Cle serveur : nouvelle "Secret key" (sb_secret_...) ou ancienne service_role (JWT)
+const supabaseKey = () => process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+
 function sbFetch(path, options = {}) {
-    const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-    return fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
-        ...options,
-        headers: { apikey: key, Authorization: `Bearer ${key}`, ...(options.headers || {}) }
-    });
+    const key = supabaseKey();
+    // Les cles sb_secret_ ne sont pas des JWT : uniquement dans l'en-tete apikey
+    const headers = key.startsWith('sb_') ? { apikey: key } : { apikey: key, Authorization: `Bearer ${key}` };
+    return fetch(`${SUPABASE_URL}/rest/v1/${path}`, { ...options, headers: { ...headers, ...(options.headers || {}) } });
 }
 
 function needsWater(p, today) {
@@ -28,9 +30,9 @@ function buildMessage(plants) {
 }
 
 exports.handler = async () => {
-    const { VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, SUPABASE_SERVICE_ROLE_KEY } = process.env;
-    if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY || !SUPABASE_SERVICE_ROLE_KEY) {
-        console.error('Variables d\'environnement manquantes (VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, SUPABASE_SERVICE_ROLE_KEY)');
+    const { VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY } = process.env;
+    if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY || !supabaseKey()) {
+        console.error('Variables d\'environnement manquantes (VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, SUPABASE_SECRET_KEY)');
         return { statusCode: 500, body: 'Configuration manquante' };
     }
     webpush.setVapidDetails('mailto:mpierre.icam@gmail.com', VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
