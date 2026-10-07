@@ -1,5 +1,5 @@
-// Service Worker - Main Verte v1.7
-const CACHE_NAME = 'main-verte-v1.7';
+// Service Worker - Main Verte v1.8
+const CACHE_NAME = 'main-verte-v1.8';
 const urlsToCache = ['/', '/index.html', '/manifest.json', '/icon-192.png', '/icon-512.png'];
 
 // =====================================================
@@ -195,10 +195,20 @@ self.addEventListener('sync', (event) => {
 });
 
 // =====================================================
-// PUSH (future-proof: if you ever add a push server)
+// PUSH (envoye chaque matin par la fonction Netlify daily-reminder)
 // =====================================================
 self.addEventListener('push', (event) => {
-    event.waitUntil(checkAndNotify());
+    let data = {};
+    try { data = event.data ? event.data.json() : {}; } catch (e) {}
+    if (!data.title) { event.waitUntil(checkAndNotify()); return; }
+    event.waitUntil(self.registration.showNotification(data.title, {
+        body: data.body || '',
+        icon: '/icon-192.png',
+        badge: '/icon-192.png',
+        tag: 'watering-reminder',
+        renotify: true,
+        data: { url: '/' }
+    }));
 });
 
 // =====================================================
